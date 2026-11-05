@@ -1,6 +1,6 @@
 # Design: a deep research report for any stock
 
-Version 0.3 · Nov 5, 2026 · @a-ramakrishnan
+Version 0.4 · Nov 5, 2026 · @a-ramakrishnan
 
 Adapted from the author's *Relay: Solution Design and Agent Methodology* (v0.1, 4 Nov 2026), a general research and monitoring platform inspired by Robyn's research results. This project keeps that document's method (evidence first, findings before prose, honest outcomes, evaluation with coverage and precision) and narrows its scope to one job: a complete research report on one Indian listed company. Robyn's internals are not known; nothing here claims to copy them.
 
@@ -103,6 +103,27 @@ Sections, each with its mandatory questions:
 - **Follow up** (`research.gather`): for up to six questions not answered (mandatory first; open before partly; skipped when the gap says there is nothing more to look for), one tool-using pass of at most eight turns with the research tools over the shared data and web search and fetch (3 searches, 4 fetches), then the question is assessed again over what was read and the computed figures.
 - **Coverage:** answered (a supported finding), partly (findings, none supported) or open, per question, on the run.
 - **Budget:** research may use 70% of the report's budget, leaving the rest for writing and review (R3). Each call reserves its worst case first: the prompt at 3 characters a token, every output token it may write, every search it may make.
+
+### The report as built (R3)
+
+- **Write** (`report.py`): one structured call over the findings, grouped by section and question with their coverage, support, period and quoted passages. Output: a one-line conclusion; three stances (the case for, the case against, what is unclear); what would change the view; each section's paragraphs. A paragraph is a fact, an interpretation or a gap, and cites findings as `[F12]`. Open questions are written as gaps.
+- **Check** (`review.py`), for every paragraph:
+  - a fact or interpretation cites existing findings
+  - a fact cites a supported fact whose quote was found
+  - every figure is in a cited passage, allowing for rounding (labels such as FY27 or Q2, years, days of the month and counts up to twelve are not figures)
+  - no finding dated after today outside "what to watch"
+  - no buy, sell or hold call, price target or recommendation
+
+  The draft as a whole needs three stances and a section for each planned one.
+- **Model review:** one call returns problems by paragraph (beyond the findings, interpretation as fact, wrong period or unit, a gap papered over, a mandatory question ignored), each marked blocking or not.
+- **Repair:** if the checks or blocking review problems found anything, one rewrite with the problems listed, then the checks again. Paragraphs that still fail are removed and named in the report's Review section; a failed conclusion or stance becomes a gap.
+- **Outcome:**
+  - **rejected:** no draft; the conclusion removed; no verified section paragraph; or fewer than half the mandatory questions answered
+  - **validated with limitations:** mandatory questions not fully answered, or paragraphs removed
+  - **validated:** none of the above
+- **Rendering:** Markdown. A header with the outcome, version, run, date, cost and shared contract version, then the disclaimer, limitations, summary and sections. Findings are cited as numbered sources, and the sources list gives each one's title, publisher, published and retrieved dates, reference and the passages relied on. A coverage table and a Review section follow.
+- **Versions:** each report is a new version per company. Writing and review use what research left of the budget (at least 30%).
+- **Export:** Markdown (`sdr export`, the Report page's download). PDF: the browser's print to PDF of the Report page, for now.
 
 ## 7. Evaluation (R4)
 

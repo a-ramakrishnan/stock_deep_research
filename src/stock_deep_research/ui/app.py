@@ -3,7 +3,7 @@ a run collected (R1). The report itself comes in R3."""
 
 import pandas as pd
 import streamlit as st
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from stock_deep_research import db, shared
@@ -199,6 +199,12 @@ def _run_research(query: str, extra: list[str], version: str) -> int | None:
                 contract_version=version,
                 progress=st.write,
             )
+            if run.status in ("succeeded", "partial"):
+                from stock_deep_research.report import OUTCOMES, write_report
+
+                made = write_report(session, run, company.name, progress=st.write)
+                st.session_state["report-isin"] = run.isin
+                st.write(f"Report version {made.version}: {OUTCOMES[made.outcome]}.")
             status.update(label=f"Run {run.id}: {run.status}, ${run.cost_usd}", state="complete")
             return run.id
 
@@ -264,6 +270,19 @@ def findings_page() -> None:
         cols[3].metric(f"Cost (budget ${run.budget_usd:.2f})", f"${run.cost_usd:.2f}")
         if run.error:
             st.error(run.error)
+        if run.status in ("succeeded", "partial") and settings.anthropic_api_key:
+            if st.button("Write a new version of the report from these findings"):
+                from stock_deep_research.report import OUTCOMES, write_report
+
+                company = shared.find_company(db.shared_engine(), run.isin)
+                with st.status("Writing and reviewing...", expanded=True):
+                    made = write_report(
+                        session, run, company.name if company else run.isin, progress=st.write
+                    )
+                st.session_state["report-isin"] = run.isin
+                st.success(
+                    f"Report version {made.version}: {OUTCOMES[made.outcome]}. See the Report page."
+                )
 
         for key in dict.fromkeys(q.section for q in plan):
             section = SECTION[key]
@@ -292,11 +311,61 @@ def _finding(session: Session, f) -> None:
         st.caption(f"  Limits: {f.limitations}")
 
 
+def report_page() -> None:
+    from stock_deep_research.models import Report
+    from stock_deep_research.report import OUTCOMES, versions
+
+    st.title("Report")
+    if _contract() is None:
+        return
+    with Session(db.engine()) as session:
+        isins = list(
+            session.scalars(
+                select(Report.isin).group_by(Report.isin).order_by(func.max(Report.id).desc())
+            )
+        )
+        if not isins:
+            st.info(
+                "No reports yet. Research a company on the Findings page, or `sdr research LT`."
+            )
+            return
+        names = {c.isin: c for c in shared.followed_companies(db.shared_engine())}
+        wanted = st.session_state.get("report-isin")
+        left, right = st.columns([3, 1])
+        isin = left.selectbox(
+            "Company",
+            isins,
+            index=isins.index(wanted) if wanted in isins else 0,
+            format_func=lambda i: f"{names[i].nse_symbol} · {names[i].name}" if i in names else i,
+        )
+        reports = versions(session, isin)
+        chosen = right.selectbox(
+            "Version",
+            reports,
+            format_func=lambda r: f"{r.version} · {r.created_at:%d %b %Y} · {OUTCOMES[r.outcome]}",
+        )
+        badge = {
+            "validated": ":green-badge[Validated]",
+            "validated_with_limitations": ":orange-badge[Validated, with limitations]",
+            "rejected": ":red-badge[Rejected]",
+        }[chosen.outcome]
+        st.markdown(badge)
+        st.download_button(
+            "Download Markdown",
+            chosen.markdown,
+            file_name=f"{(names[isin].nse_symbol if isin in names else isin)}-report-v"
+            f"{chosen.version}.md",
+            mime="text/markdown",
+        )
+        st.markdown(chosen.markdown.replace("$", "\\$"))
+
+
 def main() -> None:
     st.set_page_config(page_title="Deep research", page_icon=":material/travel_explore:")
     page = st.navigation(
         [
             st.Page(companies_page, title="Companies", icon=":material/apartment:", default=True),
+            st.Page(report_page, title="Report", icon=":material/article:"),
             st.Page(findings_page, title="Findings", icon=":material/checklist:"),
             st.Page(evidence_page, title="Evidence", icon=":material/fact_check:"),
         ]
