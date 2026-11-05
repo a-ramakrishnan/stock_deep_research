@@ -31,7 +31,7 @@ def test_render_is_one_line_per_field_with_text_last():
 def test_collect_keeps_every_dataset_as_sources(ev):
     counts = ev.collect()
     assert set(counts) == set(DATASETS)
-    assert counts["results"] == 2 and counts["company"] == 1 and counts["peers"] == 1
+    assert counts["results"] == 8 and counts["company"] == 1 and counts["peers"] == 1
     assert counts["filings"] == 2  # the board meeting has no text
     assert counts["news"] == 1  # the irrelevant article is left out
     assert counts["events"] == 1  # only the ones that passed the check
@@ -219,10 +219,10 @@ def test_evidence_command(research_url, shared_url, monkeypatch):
     try:
         result = runner.invoke(app, ["evidence", "LT"])
         assert result.exit_code == 0, result.stdout
-        assert "results           2" in result.stdout
+        assert "results           8" in result.stdout
         run_id = int(result.stdout.split()[1].rstrip(":"))
         listed = runner.invoke(app, ["sources", str(run_id), "--dataset", "results"])
-        assert listed.stdout.count("Results Q") == 2
+        assert listed.stdout.count("Results Q") == 6
         with Session(create_engine(research_url)) as session:
             some = session.scalar(
                 select(Source).where(Source.run_id == run_id, Source.dataset == "orders")
