@@ -182,10 +182,11 @@ def research(
         [], "--question", "-q", help="A question of your own to add; repeat for more."
     ),
     budget: float = typer.Option(None, help="Dollars for the whole report (default .env's)."),
+    report: bool = typer.Option(True, help="Write, review and publish the report afterwards."),
 ) -> None:
-    """Research a company (R2): collect the shared data, assess it into findings with quoted
-    passages, follow up open questions with the research tools and the web. Uses at most 70%
-    of the budget, leaving the rest for writing the report."""
+    """Research a company and write its report: collect the shared data, assess it into
+    findings with quoted passages, follow up open questions with the research tools and the
+    web (at most 70% of the budget), then write, review and publish the report."""
     from sqlalchemy.orm import Session
 
     from stock_deep_research import db, shared
@@ -213,6 +214,67 @@ def research(
             progress=lambda step: typer.echo(f"  {step}"),
         )
         _print_findings(session, run.id)
+        if report and run.status in ("succeeded", "partial"):
+            _write(session, run, found.name)
+
+
+def _write(session, run, name: str) -> None:
+    from stock_deep_research.report import OUTCOMES, write_report
+
+    made = write_report(session, run, name, progress=lambda step: typer.echo(f"  {step}"))
+    typer.echo(
+        f"\nReport version {made.version}: {OUTCOMES[made.outcome]}. Total cost ${run.cost_usd} "
+        f"of ${run.budget_usd}. Read it: sdr export {run.symbol or run.isin}"
+    )
+
+
+@app.command("report")
+def report_cmd(run_id: int) -> None:
+    """Write, review and publish a report from a research run already done (a new version)."""
+    from sqlalchemy.orm import Session
+
+    from stock_deep_research import db, shared
+    from stock_deep_research.models import Run
+
+    if not get_settings().anthropic_api_key:
+        typer.echo("Writing a report needs ANTHROPIC_API_KEY in .env.")
+        raise typer.Exit(1)
+    with Session(db.engine()) as session:
+        run = session.get(Run, run_id)
+        if run is None or not (run.plan or {}).get("questions"):
+            typer.echo(f"No research run {run_id}.")
+            raise typer.Exit(1)
+        found = shared.find_company(db.shared_engine(), run.isin)
+        _write(session, run, found.name if found else run.symbol or run.isin)
+
+
+@app.command()
+def export(
+    query: str,
+    version: int = typer.Option(None, help="A version (default the latest)."),
+    out: str = typer.Option(None, help="Write the Markdown to this file instead of printing."),
+) -> None:
+    """A company's report as Markdown: by symbol or ISIN, the latest version or one named."""
+    from pathlib import Path
+
+    from sqlalchemy.orm import Session
+
+    from stock_deep_research import db, shared
+    from stock_deep_research.report import versions
+
+    found = shared.find_company(db.shared_engine(), query)
+    isin = found.isin if found else query.upper()
+    with Session(db.engine()) as session:
+        reports = versions(session, isin)
+        chosen = next((r for r in reports if version in (None, r.version)), None)
+        if chosen is None:
+            typer.echo(f"No report for {query}" + (f" version {version}." if version else "."))
+            raise typer.Exit(1)
+        if out:
+            Path(out).write_text(chosen.markdown)
+            typer.echo(f"Wrote version {chosen.version} to {out}.")
+        else:
+            typer.echo(chosen.markdown)
 
 
 @app.command("findings")

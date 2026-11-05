@@ -6,15 +6,15 @@ A deep research report for any Indian listed stock: evidence first, every claim 
 
 ## Status
 
-R0–R2 are done: the project, its databases, the evidence layer (shared records and web pages kept as sources, excerpts located in them, the research tools) and the research loop (findings with quoted passages, follow-up of open questions, a hard budget). The written report and its review come in R3, evaluation in R4; see [docs/design/design.md](docs/design/design.md).
+R0–R3 are done: the project, its databases, the evidence layer (shared records and web pages kept as sources, excerpts located in them, the research tools), the research loop (findings with quoted passages, follow-up of open questions, a hard budget) and the report (written from the findings, checked number by number, reviewed, published as validated, validated with limitations or rejected). Evaluation comes in R4; see [docs/design/design.md](docs/design/design.md).
 
 | Step | What | Status |
 | --- | --- | --- |
 | R0 | Project, shared data contract check, own database and tables, design | done |
 | R1 | Evidence: shared records and web pages kept as sources with excerpts; the research tools | done |
 | R2 | The research loop: plan, collect, assess into findings, targeted follow-up, within a budget | done |
-| R3 | Review (numbers, periods, dates, citations), the report in sections, the report page, export | next |
-| R4 | Evaluation: a fixed set of stocks, human-checked claims, coverage, cost and time per report | |
+| R3 | Review (numbers, periods, dates, citations), the report in sections, the report page, export | done |
+| R4 | Evaluation: a fixed set of stocks, human-checked claims, coverage, cost and time per report | next |
 
 ## How it fits with stock_news_analyzer
 
@@ -42,12 +42,14 @@ uv run sdr company LT       # look a company up in the shared data
 uv run sdr evidence LT      # collect its shared data into a run (free); prints the run id
 uv run sdr sources 1        # what run 1 kept; `sdr source ID` shows one as it was read
 uv run sdr evidence LT --web "Who are L&T's main competitors in EPC?"   # adds web pages (paid)
-uv run sdr research LT      # the research loop: findings with quoted passages (paid, up to 70% of the budget)
+uv run sdr research LT      # research, then write, review and publish the report (paid, up to the budget)
 uv run sdr findings 2       # a run's findings by section, and which questions are answered
+uv run sdr export LT --out LT.md   # the latest report as Markdown
+uv run sdr report 2         # a new version of the report from run 2's findings
 uv run streamlit run src/stock_deep_research/ui/app.py --server.port 8502
 ```
 
-The Findings and Evidence pages (in the sidebar) run and show the same. A `--web` question costs its tokens plus $0.01 a search, typically a few cents to about $0.30; a report will cost at most `REPORT_BUDGET_USD` (default $5).
+The Report, Findings and Evidence pages (in the sidebar) run and show the same; the Report page downloads the Markdown (for PDF, print the page). A `--web` question costs its tokens plus $0.01 a search, typically a few cents to about $0.30; a report will cost at most `REPORT_BUDGET_USD` (default $5).
 
 ## Development
 
