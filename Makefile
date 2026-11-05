@@ -1,4 +1,4 @@
-.PHONY: help install db health ui test lint
+.PHONY: help install db health ui test lint evidence
 
 help:           ## List the commands
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | sed 's/:.*## /\t/'
@@ -20,3 +20,6 @@ test:           ## Tests (those needing Postgres skip when it isn't on localhost
 
 lint:           ## Lint and format checks
 	uv run ruff check . && uv run ruff format --check .
+
+evidence:       ## Collect a company's shared evidence into a run: make evidence S=LT
+	uv run sdr evidence $(S)

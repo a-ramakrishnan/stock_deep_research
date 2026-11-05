@@ -1,6 +1,6 @@
 # Design: a deep research report for any stock
 
-Version 0.1 · Nov 5, 2026 · @a-ramakrishnan
+Version 0.2 · Nov 5, 2026 · @a-ramakrishnan
 
 Adapted from the author's *Relay: Solution Design and Agent Methodology* (v0.1, 4 Nov 2026), a general research and monitoring platform inspired by Robyn's research results. This project keeps that document's method (evidence first, findings before prose, honest outcomes, evaluation with coverage and precision) and narrows its scope to one job: a complete research report on one Indian listed company. Robyn's internals are not known; nothing here claims to copy them.
 
@@ -46,7 +46,7 @@ Own tables (migration 0001):
 | --- | --- |
 | `runs` | The request, the company, status (queued, running, succeeded, partial, failed, cancelled), model, budget and cost, tool calls, the plan, the shared contract version read |
 | `run_events` | The decision record: per stage, the question, the tool, what was found, why it stopped; cost per step. Not the model's hidden reasoning |
-| `sources` | Everything read, as it was: a shared record (`shared.results:LT:Q2 FY27`) or a web page (URL, title, publisher, published and retrieved times, content hash, text, retrieval status: ok, blocked, failed) |
+| `sources` | Everything read, as it was: a shared record (`shared.results:LT:2026-09-30:3m:consolidated`, its dataset and fields) or a web page (URL, title, publisher, published and retrieved times, content hash, text, retrieval status: ok, listed, blocked, failed, unreadable); one per ref in a run (migration 0002) |
 | `excerpts` | The passages relied on, with their position in the source's text (none when the passage isn't found: such a citation fails the review) |
 | `findings` | Atomic claims: section, the question they answer, the claim, fact or interpretation, support (supported, conflicting, insufficient, inferred), excerpts, the period or date they concern, limitations |
 | `reports` | Versions of a company's report: outcome (validated, validated with limitations, rejected), sections, coverage per question, Markdown |
@@ -57,6 +57,16 @@ Invariants, from Relay:
 2. Publication, retrieval and event dates stay apart; every number names its period.
 3. Missing or blocked evidence is a recorded gap, never filled with plausible text.
 4. Every report names its run, its sources' dates and the shared contract version.
+
+### Evidence (R1)
+
+**Shared records.** Each dataset of the shared views (company, peers, results, balance sheets, price summary, month-end prices, index valuations, corporate actions, shareholding, filings with their text, relevant news, checked events, orders, order books, earnings calls with their points, promises, open red flags, deals) is read newest first to a default depth and kept as sources. A record is one source with a stable ref (`shared.results:LT:2026-09-30:3m:consolidated`, `shared.documents:11`), its fields as read (`data`) and a text of one `field: value` line per field, so a number can be traced to its line; a series (prices, index valuations, deals, corporate actions, peers) is one source with a line per row. Reading the same ref twice in a run keeps the first reading.
+
+**Research tools** (for R2's loop): `shared_data(dataset, limit)`, `search_documents(query)` (a snippet per hit, nothing kept) and `read_document(document_id)`; answers label each source `[S<id>]`.
+
+**The web.** Claude's web search and web fetch tools (`web_search_20260209`, `web_fetch_20260209`; at most 5 searches and 6 fetches a question, a fetched page capped at 30,000 tokens). Every fetched page is kept with its URL, title, retrieval time, hash and text; a search result seen but not fetched is `listed` (no text, so it can't be cited); a page that couldn't be fetched is `blocked` or `failed`; a PDF fetched is `unreadable` (no text kept). The model's answer is a lead, not evidence. Cost per call is computed from its usage (list prices; $0.01 a search) and added to the run.
+
+**Excerpts.** A quote is located in its source's text exactly, then with whitespace and case relaxed; not found, it is kept with no position and fails the review.
 
 ## 5. The report
 
