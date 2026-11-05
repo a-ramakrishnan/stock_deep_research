@@ -32,3 +32,9 @@ def cost(model: str, usage) -> Decimal:
     server = getattr(usage, "server_tool_use", None)
     searches = (getattr(server, "web_search_requests", 0) or 0) if server else 0
     return (tokens + searches * WEB_SEARCH).quantize(Decimal("0.0001"))
+
+
+def response_cost(requested: str, response) -> Decimal:
+    """A response's cost at the prices of the model that served it (a fallback may differ)."""
+    served = getattr(response, "model", None)
+    return cost(served if served in PRICES else requested, response.usage)

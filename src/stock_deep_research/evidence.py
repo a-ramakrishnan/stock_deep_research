@@ -317,6 +317,7 @@ class Evidence:
         self.run = run
         self.shared = shared
         self.company = company
+        self.touched: list[int] = []  # ids of sources kept or re-read, in order (see `mark`)
 
     def event(self, stage: str, message: str, cost: Decimal = Decimal(0)) -> RunEvent:
         """Add a step to the run's decision record, and its cost to the run's."""
@@ -337,6 +338,10 @@ class Evidence:
             select(Source).where(Source.run_id == self.run.id, Source.ref == ref)
         )
 
+    def mark(self) -> int:
+        """A point in `touched`: `touched[mark:]` is what was read since."""
+        return len(self.touched)
+
     def keep(
         self,
         *,
@@ -354,6 +359,7 @@ class Evidence:
         source = self.get(ref)
         if source is not None:
             if source.text is not None or (body is None and status == "listed"):
+                self.touched.append(source.id)
                 return source  # read once; the first reading stands
             # a search result now fetched (or found unfetchable): record the fetch
             data = {**(source.data or {}), **(data or {})}
@@ -370,6 +376,7 @@ class Evidence:
         if retrieved_at is not None:
             source.retrieved_at = retrieved_at
         self.session.flush()
+        self.touched.append(source.id)
         return source
 
     def read(self, name: str, limit: int | None = None) -> list[Source]:

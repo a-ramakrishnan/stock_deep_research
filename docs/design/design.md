@@ -1,6 +1,6 @@
 # Design: a deep research report for any stock
 
-Version 0.2 · Nov 5, 2026 · @a-ramakrishnan
+Version 0.3 · Nov 5, 2026 · @a-ramakrishnan
 
 Adapted from the author's *Relay: Solution Design and Agent Methodology* (v0.1, 4 Nov 2026), a general research and monitoring platform inspired by Robyn's research results. This project keeps that document's method (evidence first, findings before prose, honest outcomes, evaluation with coverage and precision) and narrows its scope to one job: a complete research report on one Indian listed company. Robyn's internals are not known; nothing here claims to copy them.
 
@@ -94,6 +94,15 @@ Sections, each with its mandatory questions:
 7. **Publish:** validated, validated with limitations (gaps shown), or rejected; partial if the budget ran out with useful findings.
 
 **Budget:** `REPORT_BUDGET_USD` (default $5) is a hard ceiling: before each call the estimated cost is reserved, after it the actual cost recorded; the run stops and publishes what it has (partial) before it would cross the ceiling. Default model: Sonnet; configurable.
+
+### As built (R2)
+
+- **Plan** (`plan.py`): 16 questions over sections 2–9, 15 mandatory; a request's own questions are added as optional, in a section of their own. Each section names the shared datasets that can answer it.
+- **Collect:** every dataset of the shared data, then **computed figures** (`derived.py`): margins, year-on-year growth against the same quarter, trailing EPS and P/E, multi-year growth, net debt, debt to equity, free cash flow, cash from operations against profit. Each line names its formula and the sources it used; the model is told not to compute, and cites these lines instead.
+- **Assess** (`research.assess`): one structured-output call per section over its sources (each dataset gets a fair share of about 140,000 characters, newest first). It returns findings (question, claim, fact or interpretation, support, quoted passages, period, limitations) and gaps (what is missing, where it might be, what to search). Code then locates every quote; a fact none of whose quotes is found, or that cites a source it was not shown, becomes `insufficient`, with the reason in its limitations.
+- **Follow up** (`research.gather`): for up to six questions not answered (mandatory first; open before partly; skipped when the gap says there is nothing more to look for), one tool-using pass of at most eight turns with the research tools over the shared data and web search and fetch (3 searches, 4 fetches), then the question is assessed again over what was read and the computed figures.
+- **Coverage:** answered (a supported finding), partly (findings, none supported) or open, per question, on the run.
+- **Budget:** research may use 70% of the report's budget, leaving the rest for writing and review (R3). Each call reserves its worst case first: the prompt at 3 characters a token, every output token it may write, every search it may make.
 
 ## 7. Evaluation (R4)
 

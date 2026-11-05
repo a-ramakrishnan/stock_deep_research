@@ -173,3 +173,81 @@ def source(source_id: int) -> None:
             typer.echo(f"published  {s.published_at.isoformat()}")
         typer.echo(f"retrieved  {s.retrieved_at.isoformat()}\nsha256     {s.content_hash}\n")
         typer.echo(s.text or "(no text kept)")
+
+
+@app.command()
+def research(
+    query: str,
+    question: list[str] = typer.Option(
+        [], "--question", "-q", help="A question of your own to add; repeat for more."
+    ),
+    budget: float = typer.Option(None, help="Dollars for the whole report (default .env's)."),
+) -> None:
+    """Research a company (R2): collect the shared data, assess it into findings with quoted
+    passages, follow up open questions with the research tools and the web. Uses at most 70%
+    of the budget, leaving the rest for writing the report."""
+    from sqlalchemy.orm import Session
+
+    from stock_deep_research import db, shared
+    from stock_deep_research.research import research as run_research
+
+    settings = get_settings()
+    if not settings.anthropic_api_key:
+        typer.echo("Research needs ANTHROPIC_API_KEY in .env.")
+        raise typer.Exit(1)
+    shared_eng = db.shared_engine()
+    version = shared.check_contract(shared_eng)
+    found = shared.find_company(shared_eng, query)
+    if found is None:
+        typer.echo(f"No single company matches '{query}'.")
+        raise typer.Exit(1)
+    with Session(db.engine()) as session:
+        run = run_research(
+            session,
+            shared_eng,
+            found,
+            request="report" + "".join(f"; {q}" for q in question),
+            questions=question,
+            budget_usd=budget,
+            contract_version=version,
+            progress=lambda step: typer.echo(f"  {step}"),
+        )
+        _print_findings(session, run.id)
+
+
+@app.command("findings")
+def findings_cmd(run_id: int) -> None:
+    """A run's findings by section, with their support and quoted passages, and its coverage."""
+    from sqlalchemy.orm import Session
+
+    from stock_deep_research import db
+
+    with Session(db.engine()) as session:
+        _print_findings(session, run_id)
+
+
+def _print_findings(session, run_id: int) -> None:
+    from stock_deep_research.models import Excerpt, Run
+    from stock_deep_research.research import findings
+
+    run = session.get(Run, run_id)
+    if run is None:
+        typer.echo(f"No run {run_id}.")
+        raise typer.Exit(1)
+    section = None
+    for f in findings(session, run_id):
+        if f.section != section:
+            section = f.section
+            typer.echo(f"\n{section.upper()}")
+        typer.echo(f"- [{f.support}, {f.claim_type}] {f.claim}")
+        for ex in session.query(Excerpt).filter(Excerpt.id.in_(f.excerpt_ids or [])):
+            mark = "" if ex.start_char is not None else "  (NOT FOUND in source)"
+            typer.echo(f'    S{ex.source_id}: "{ex.quote[:160]}"{mark}')
+        if f.limitations:
+            typer.echo(f"    limits: {f.limitations}")
+    cover = (run.plan or {}).get("coverage", {})
+    if cover:
+        typer.echo("\nCOVERAGE")
+        for qid, state in cover.items():
+            typer.echo(f"  {state:<9}{qid}")
+    typer.echo(f"\nRun {run.id}: {run.status}, ${run.cost_usd} of ${run.budget_usd}")
