@@ -75,10 +75,12 @@ class Source(Base):
     """Something read: a record of the shared data or a web page, as it was when retrieved."""
 
     __tablename__ = "sources"
+    __table_args__ = (UniqueConstraint("run_id", "ref", name="uq_sources_run_ref"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     run_id: Mapped[int] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), index=True)
     kind: Mapped[str] = mapped_column(String(8))  # shared, web
+    dataset: Mapped[str | None] = mapped_column(String(32))  # results, documents, ... or web
     ref: Mapped[str] = mapped_column(Text)  # 'shared.results:LT:Q2 FY27' or the URL
     title: Mapped[str | None] = mapped_column(Text)
     publisher: Mapped[str | None] = mapped_column(Text)
@@ -86,9 +88,11 @@ class Source(Base):
     retrieved_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
-    retrieval_status: Mapped[str] = mapped_column(String(16), default="ok")  # ok, blocked, failed
+    # ok; listed (a search result, not fetched); blocked, failed, unreadable (no text kept)
+    retrieval_status: Mapped[str] = mapped_column(String(16), default="ok")
     content_hash: Mapped[str | None] = mapped_column(String(64))
     text: Mapped[str | None] = mapped_column(Text)
+    data: Mapped[dict | None] = mapped_column(JSONB)  # a shared record's fields, as read
 
 
 class Excerpt(Base):

@@ -66,4 +66,4 @@ def test_health_reports_both_databases(research_url, shared_url, monkeypatch):
     get_settings.cache_clear()
     assert result.exit_code == 0, result.stdout
     assert "shared data   ok, contract 1.0" in result.stdout
-    assert "own database  ok, migration 0001" in result.stdout
+    assert "own database  ok, migration 0002" in result.stdout
