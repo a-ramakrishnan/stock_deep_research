@@ -46,10 +46,12 @@ uv run sdr research LT      # research, then write, review and publish the repor
 uv run sdr findings 2       # a run's findings by section, and which questions are answered
 uv run sdr export LT --out LT.md   # the latest report as Markdown
 uv run sdr report 2         # a new version of the report from run 2's findings
+uv run sdr eval 2           # score run 2 and audit its report's 5-layer data veracity
+uv run sdr eval --traps     # run the 5-layer adversarial veracity traps
 uv run streamlit run src/stock_deep_research/ui/app.py --server.port 8502
 ```
 
-The Report, Findings and Evidence pages (in the sidebar) run and show the same; the Report page downloads the Markdown (for PDF, print the page). A `--web` question costs its tokens plus $0.01 a search, typically a few cents to about $0.30; a report will cost at most `REPORT_BUDGET_USD` (default $5).
+The Report, Findings, Evidence and Evaluation & Veracity pages (in the sidebar) run and show the same; the Report page downloads the Markdown (for PDF, print the page). A `--web` question costs its tokens plus $0.01 a search, typically a few cents to about $0.30; a report will cost at most `REPORT_BUDGET_USD` (default $5).
 
 ## Development
 
