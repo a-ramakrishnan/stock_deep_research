@@ -8,11 +8,15 @@ couldn't be fetched is kept as `blocked` or `failed`, a recorded gap. The model'
 lead for the research loop (R2), not evidence: only the pages are.
 """
 
+import base64
+import binascii
+import io
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 
 import anthropic
+from pypdf import PdfReader
 
 from stock_deep_research import costs
 from stock_deep_research.evidence import Evidence
@@ -61,6 +65,20 @@ def _when(stamp: str | None) -> datetime | None:
         return None
 
 
+def _extract_pdf_text(b64_data: str | None) -> str | None:
+    """Extract plain text from base64-encoded PDF bytes; None if empty or invalid."""
+    if not b64_data:
+        return None
+    try:
+        raw = base64.b64decode(b64_data, validate=False)
+        reader = PdfReader(io.BytesIO(raw))
+        pages = [page.extract_text() or "" for page in reader.pages]
+        text = "\n\n".join(p.strip() for p in pages if p.strip()).strip()
+        return text or None
+    except (binascii.Error, Exception):
+        return None
+
+
 def harvest(evidence: Evidence, content: list) -> list[Source]:
     """Keep every search result and fetched page in a response's content as sources."""
     asked: dict[str, dict] = {}  # server tool call id -> its input (the URL fetched)
@@ -91,17 +109,23 @@ def harvest(evidence: Evidence, content: list) -> list[Source]:
                 continue
             if getattr(result, "type", None) == "web_fetch_result":
                 doc = result.content
-                is_text = getattr(doc.source, "type", None) == "text"
+                src_type = getattr(doc.source, "type", None)
+                media_type = getattr(doc.source, "media_type", None)
+                body = None
+                if src_type == "text":
+                    body = doc.source.data
+                elif src_type == "base64" and media_type == "application/pdf":
+                    body = _extract_pdf_text(getattr(doc.source, "data", None))
                 kept.append(
                     evidence.keep(
                         kind="web",
                         dataset="web",
                         ref=url,
                         title=doc.title,
-                        body=doc.source.data if is_text else None,
-                        status="ok" if is_text else "unreadable",  # a PDF: no text kept
+                        body=body,
+                        status="ok" if body else "unreadable",
                         retrieved_at=_when(result.retrieved_at),
-                        data={"media_type": getattr(doc.source, "media_type", None)},
+                        data={"media_type": media_type},
                     )
                 )
             else:

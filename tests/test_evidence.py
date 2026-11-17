@@ -207,6 +207,26 @@ def test_costs():
         costs.cost("unknown-model", usage)
 
 
+def test_extract_pdf_text_handles_invalid_and_valid_pdfs():
+    import base64
+
+    assert web._extract_pdf_text("JVBER") is None  # invalid/truncated PDF
+    # Minimal valid 1-page PDF with "L&T Order" text stream
+    pdf = (
+        b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+        b"2 0 obj<</Type/Pages/Count 1/Kids[3 0 R]>>endobj\n"
+        b"3 0 obj<</Type/Page/MediaBox[0 0 200 200]/Parent 2 0 R"
+        b"/Resources<</Font<</F1 4 0 R>>>>/Contents 5 0 R>>endobj\n"
+        b"4 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\n"
+        b"5 0 obj<</Length 44>>stream\nBT /F1 12 Tf 10 100 Td (L&T Order) Tj ET\nendstream endobj\n"
+        b"xref\n0 6\n0000000000 65535 f \n0000000009 00000 n \n0000000056 00000 n \n"
+        b"0000000111 00000 n \n0000000237 00000 n \n0000000305 00000 n \n"
+        b"trailer<</Size 6/Root 1 0 R>>\nstartxref\n398\n%%EOF"
+    )
+    extracted = web._extract_pdf_text(base64.b64encode(pdf).decode())
+    assert extracted is not None and "L&T Order" in extracted
+
+
 @pytest.mark.db
 def test_evidence_command(research_url, shared_url, monkeypatch):
     from stock_deep_research.cli import app
