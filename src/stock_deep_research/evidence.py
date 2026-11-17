@@ -95,9 +95,26 @@ DATASETS: dict[str, Dataset] = {
         ),
         Dataset(
             "peers",
-            "The listed peers stock_news_analyzer compares it with.",
-            """SELECT c.nse_symbol, c.isin, c.name, c.industry, c.market_cap_cr
-               FROM shared.peers p JOIN shared.companies c ON c.isin = p.peer_isin
+            "The listed peers stock_news_analyzer compares it with, plus their latest annual "
+            "results and closing price when available.",
+            """SELECT c.nse_symbol, c.isin, c.name, c.industry, c.market_cap_cr,
+                      r.period AS latest_period, r.revenue_cr AS latest_revenue_cr,
+                      r.pat_cr AS latest_pat_cr, r.eps AS latest_eps,
+                      pr.close AS last_close, pr.trade_date AS price_as_of
+               FROM shared.peers p
+               JOIN shared.companies c ON c.isin = p.peer_isin
+               LEFT JOIN LATERAL (
+                   SELECT period, revenue_cr, pat_cr, eps
+                   FROM shared.results
+                   WHERE isin = p.peer_isin AND "primary" AND months = 12
+                   ORDER BY period_end DESC LIMIT 1
+               ) r ON true
+               LEFT JOIN LATERAL (
+                   SELECT close, trade_date
+                   FROM shared.prices_daily
+                   WHERE isin = p.peer_isin
+                   ORDER BY trade_date DESC LIMIT 1
+               ) pr ON true
                WHERE p.isin = :isin ORDER BY c.market_cap_cr DESC NULLS LAST LIMIT :limit""",
             lambda r, s: f"shared.peers:{s}",
             lambda r: "Peers",

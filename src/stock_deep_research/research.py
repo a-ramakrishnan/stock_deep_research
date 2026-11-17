@@ -39,7 +39,7 @@ from stock_deep_research.shared import Company
 RESEARCH_SHARE = Decimal("0.7")
 ASSESS_TOKENS = 16_000  # thinking and the findings
 SOURCE_CHARS = 5_000  # of one source in an assessment's context
-DOCUMENT_CHARS = 12_000  # of a filing, article or web page
+DOCUMENT_CHARS = 24_000  # of a filing, article or web page
 SECTION_CHARS = 140_000  # of all sources in one assessment (about 40k tokens)
 MAX_FOLLOW_UPS = 6
 GATHER_TURNS = 8
@@ -115,25 +115,30 @@ def _clip(s: Source) -> str:
 
 
 def context(found: list[Source], cap: int = SECTION_CHARS) -> tuple[str, list[Source]]:
-    """The sources as the model sees them, and those shown. Each dataset gets a fair share of
-    `cap` characters (newest records first), so long filings don't crowd out the rest."""
-    groups: dict[str, list[Source]] = {}
+    """The sources as the model sees them, and those shown. Smaller datasets take what they need
+    first so their unused budget flows to longer datasets (filings, concalls, news)."""
+    groups: dict[str, list[tuple[Source, str]]] = {}
     for s in found:
         if s.text:
-            groups.setdefault(s.dataset or s.kind, []).append(s)
+            groups.setdefault(s.dataset or s.kind, []).append((s, _clip(s)))
     if not groups:
         return "", []
-    share = cap // len(groups)
+    # Process smallest datasets first so unused allowance redistributes to larger ones.
+    ordered = sorted(groups.values(), key=lambda items: sum(len(b) for _, b in items))
+    remaining_cap = cap
+    remaining_groups = len(ordered)
     parts, shown = [], []
-    for members in groups.values():
+    for members in ordered:
+        share = remaining_cap // remaining_groups
         size = 0
-        for s in members:
-            block = _clip(s)
+        for s, block in members:
             if size + len(block) > share and size > 0:
                 break
             parts.append(block)
             shown.append(s)
             size += len(block)
+        remaining_cap = max(0, remaining_cap - size)
+        remaining_groups -= 1
     return "\n\n".join(parts), shown
 
 
@@ -404,8 +409,13 @@ def research(
 
         cover = coverage(session, run, plan)
         todo = sorted(
-            (q for q in plan if cover[q.id] != "answered"),
-            key=lambda q: (not q.mandatory, cover[q.id] == "partly"),
+            (
+                q
+                for q in plan
+                if cover[q.id] != "answered"
+                or (q.id in gaps and gaps[q.id].look in ("web", "filings"))
+            ),
+            key=lambda q: (not q.mandatory, cover[q.id] == "answered", cover[q.id] == "partly"),
         )
         for q in todo[:MAX_FOLLOW_UPS]:
             gap = gaps.get(q.id)
@@ -417,8 +427,11 @@ def research(
             session.commit()
             if not read:
                 continue
+            # Put newly gathered sources first, followed by section context & derived figures.
+            existing = section_sources(ev, SECTION[q.section])
             figures_src = [figures] if figures else []
-            assess(ev, client, model, budget, SECTION[q.section], [q], read + figures_src, today)
+            merged = list({s.id: s for s in [*read, *figures_src, *existing]}.values())
+            assess(ev, client, model, budget, SECTION[q.section], [q], merged, today)
             session.commit()
         run.status = "succeeded"
     except BudgetStop as stop:

@@ -10,9 +10,17 @@ same basis.
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
+from statistics import median
 
 from stock_deep_research.evidence import Evidence
 from stock_deep_research.models import Source
+
+_FINANCIAL_TERMS = ("bank", "financial", "nbfc", "insurance", "finance", "lending")
+
+
+def _is_financial(industry: str | None) -> bool:
+    low = (industry or "").lower()
+    return any(term in low for term in _FINANCIAL_TERMS)
 
 
 def _d(v) -> Decimal | None:
@@ -44,6 +52,10 @@ class _Period:
     basis: str
     label: str
     revenue: Decimal | None
+    other_income: Decimal | None
+    finance_costs: Decimal | None
+    depreciation: Decimal | None
+    pbt: Decimal | None
     pat: Decimal | None
     eps: Decimal | None
 
@@ -62,6 +74,10 @@ def _periods(found: list[Source]) -> list[_Period]:
                 d["basis"],
                 d.get("period") or d["period_end"],
                 _d(d.get("revenue_cr")),
+                _d(d.get("other_income_cr")),
+                _d(d.get("finance_costs_cr")),
+                _d(d.get("depreciation_cr")),
+                _d(d.get("pbt_cr")),
                 _d(d.get("pat_cr")),
                 _d(d.get("eps")),
             )
@@ -78,6 +94,7 @@ def _year_before(p: _Period, rows: list[_Period]) -> _Period | None:
 
 def lines(evidence: Evidence) -> list[str]:
     results = [s for s in evidence.read("results") if s.data]
+    is_fin = _is_financial(evidence.company.industry)
     out: list[str] = []
     periods = _periods(results)
     quarters = [p for p in periods if p.months == 3]
@@ -92,6 +109,17 @@ def lines(evidence: Evidence) -> list[str]:
             bits.append(f"revenue {_pct(p.revenue, prior.revenue)} on {prior.label}")
         if prior and p.pat and prior.pat:
             bits.append(f"PAT {_pct(p.pat, prior.pat)} on {prior.label}")
+        if p.revenue and p.pbt:
+            bits.append(f"PBT margin {_r(p.pbt / p.revenue * 100, 1)}%")
+        if (
+            not is_fin
+            and p.revenue
+            and p.pbt is not None
+            and p.finance_costs is not None
+            and p.depreciation is not None
+        ):
+            ebitda = p.pbt + p.finance_costs + p.depreciation - (p.other_income or Decimal(0))
+            bits.append(f"EBITDA margin {_r(ebitda / p.revenue * 100, 1)}%")
         if bits:
             cited = f"[S{p.source.id}" + (f",S{prior.source.id}]" if prior else "]")
             out.append(f"{p.label} ({p.basis}): " + "; ".join(bits) + f" {cited}")
@@ -137,6 +165,31 @@ def lines(evidence: Evidence) -> list[str]:
                 f"{_r(cagr, 1)}% [S{first.source.id},S{last.source.id}]"
             )
 
+    monthly = evidence.read("prices_monthly")
+    if monthly and (years or latest):
+        annual_eps = [y for y in years if y.eps and y.eps > 0]
+        hist_pes: list[Decimal] = []
+        used_sources: list[int] = [monthly[0].id]
+        rows = (monthly[0].data or {}).get("rows") or []
+        for row in rows:
+            td = _date(row.get("trade_date"))
+            cl = _d(row.get("close"))
+            if not td or not cl:
+                continue
+            ref_y = next((y for y in annual_eps if y.end <= td), None)
+            if ref_y and ref_y.eps:
+                hist_pes.append(cl / ref_y.eps)
+                if ref_y.source.id not in used_sources:
+                    used_sources.append(ref_y.source.id)
+        if len(hist_pes) >= 3:
+            dates = [str(r.get("trade_date"))[:10] for r in rows if r.get("trade_date")]
+            ids = ",".join(f"S{i}" for i in used_sources)
+            out.append(
+                f"P/E history ({len(hist_pes)} months, {min(dates)} to {max(dates)}): "
+                f"min {_r(min(hist_pes), 1)}, median {_r(Decimal(str(median(hist_pes))), 1)}, "
+                f"max {_r(max(hist_pes), 1)} [{ids}]"
+            )
+
     sheets = sorted(
         (s for s in evidence.read("balance_sheets") if s.data),
         key=lambda s: s.data["period_end"],
@@ -146,13 +199,13 @@ def lines(evidence: Evidence) -> list[str]:
         d = s.data
         debt, cash = _d(d.get("borrowings_cr")), _d(d.get("cash_cr"))
         bits = []
-        if debt is not None and cash is not None:
+        if not is_fin and debt is not None and cash is not None:
             bits.append(f"net debt Rs {_r(debt - cash, 0)} crore (borrowings less cash)")
         equity = _d(d.get("equity_cr"))
         if debt is not None and equity:
             bits.append(f"debt to equity {_r(debt / equity)}")
         cfo, capex = _d(d.get("cfo_cr")), _d(d.get("capex_cr"))
-        if cfo is not None and capex is not None:
+        if not is_fin and cfo is not None and capex is not None:
             bits.append(f"free cash flow Rs {_r(cfo - capex, 0)} crore over {d['months']} months")
         match = next(
             (
@@ -165,15 +218,40 @@ def lines(evidence: Evidence) -> list[str]:
             None,
         )
         cited = f"S{s.id}"
+        if match and match.pat and equity and equity > 0 and match.months == 12:
+            bits.append(f"ROE {_r(match.pat / equity * 100, 1)}%")
+            if f"S{match.source.id}" not in cited:
+                cited += f",S{match.source.id}"
         if cfo is not None and match and match.pat and match.pat > 0:
             bits.append(f"cash from operations {_r(cfo / match.pat * 100, 0)}% of PAT")
-            cited += f",S{match.source.id}"
+            if f"S{match.source.id}" not in cited:
+                cited += f",S{match.source.id}"
         if bits:
             out.append(
                 f"Balance sheet {d['period_end']} ({d['basis']}): "
                 + "; ".join(bits)
                 + f" [{cited}]"
             )
+
+    peers = evidence.read("peers")
+    if peers:
+        for row in (peers[0].data or {}).get("rows") or []:
+            sym = row.get("nse_symbol") or row.get("isin")
+            p_rev = _d(row.get("latest_revenue_cr"))
+            p_pat = _d(row.get("latest_pat_cr"))
+            p_eps = _d(row.get("latest_eps"))
+            p_close = _d(row.get("last_close"))
+            p_bits = []
+            if p_rev and p_pat:
+                p_bits.append(f"PAT margin {_r(p_pat / p_rev * 100, 1)}%")
+            if p_close and p_eps and p_eps > 0:
+                p_bits.append(f"P/E {_r(p_close / p_eps, 1)}")
+            if p_bits:
+                out.append(
+                    f"Peer {sym} ({row.get('latest_period') or 'latest'}): "
+                    + "; ".join(p_bits)
+                    + f" [S{peers[0].id}]"
+                )
     return out
 
 

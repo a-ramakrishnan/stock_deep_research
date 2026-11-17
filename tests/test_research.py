@@ -236,6 +236,17 @@ def test_context_gives_each_dataset_a_share():
     ]
     body, shown = research.context(long + short, cap=12_000)
     assert 100 in [s.id for s in shown] and len(shown) < 11 and "[S100]" in body
+    # Water-filling: unused allowance from `short` lets 2 filings of 5,000 chars fit inside 12,000
+    assert sum(1 for s in shown if s.dataset == "filings") == 2
+
+
+def test_is_financial_sector_detection():
+    from stock_deep_research.derived import _is_financial
+
+    assert _is_financial("Financial Services")
+    assert _is_financial("Private Sector Bank")
+    assert not _is_financial("Construction")
+    assert not _is_financial(None)
 
 
 @pytest.mark.db
