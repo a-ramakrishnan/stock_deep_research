@@ -13,6 +13,8 @@ from sqlalchemy.orm import Session
 from stock_deep_research.models import Excerpt, Source
 
 _SPACE = re.compile(r"\s+")
+_ELLIPSIS = re.compile(r"\s*(?:\.\.\.|…)\s*")
+MIN_SPAN_CHARS = 12
 
 
 def _normalised(s: str) -> tuple[str, list[int]]:
@@ -27,7 +29,8 @@ def _normalised(s: str) -> tuple[str, list[int]]:
 
 
 def locate(body: str | None, quote: str) -> int | None:
-    """Where `quote` starts in `body`, or None."""
+    """Where `quote` starts in `body`, or None. Supports `...` / `…` multi-span quotes when every
+    span is at least `MIN_SPAN_CHARS` characters and appears in order."""
     quote = quote.strip()
     if not body or not quote:
         return None
@@ -37,7 +40,23 @@ def locate(body: str | None, quote: str) -> int | None:
     norm, where = _normalised(body)
     q = _SPACE.sub(" ", quote).lower()
     at = norm.find(q)
-    return where[at] if at >= 0 else None
+    if at >= 0:
+        return where[at]
+    if "..." in quote or "…" in quote:
+        spans = [_SPACE.sub(" ", s).lower().strip() for s in _ELLIPSIS.split(quote)]
+        spans = [s for s in spans if s]
+        if len(spans) >= 2 and all(len(s) >= MIN_SPAN_CHARS for s in spans):
+            cursor = 0
+            first_at: int | None = None
+            for span in spans:
+                pos = norm.find(span, cursor)
+                if pos < 0:
+                    return None
+                if first_at is None:
+                    first_at = pos
+                cursor = pos + len(span)
+            return where[first_at]
+    return None
 
 
 def excerpt(session: Session, source: Source, quote: str) -> Excerpt:

@@ -22,7 +22,10 @@ MARKER = re.compile(r"\[F(\d+)\]")
 # A figure: digits with Indian or Western grouping, optional decimals; not part of a label
 NUMBER = re.compile(r"(?<![A-Za-z0-9.])(\d{1,3}(?:,\d{2,3})+|\d+)(?:\.(\d+))?(?![A-Za-z0-9])")
 MONTHS = r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*"
-FIGURE_AFTER = re.compile(r"\s*(%|x\b|×|crore|cr\b|lakh|bn|billion|mn|million|per cent)", re.I)
+FIGURE_AFTER = re.compile(
+    r"\s*(%|x\b|×|bps\b|basis points\b|crore|cr\b|lakh|bn|billion|mn|million|per cent)", re.I
+)
+BPS_AFTER = re.compile(r"\s*(?:bps|basis points)\b", re.I)
 ADVICE = re.compile(
     r"\b(we recommend|recommend(?:ed|s)? (?:buying|selling|holding)|target price|price target|"
     r"(?:a |rated? )?(?:buy|sell|hold|accumulate|outperform|underperform) (?:rating|call)|"
@@ -99,9 +102,48 @@ def matches(value: Decimal, decimals: int, allowed: list[Decimal]) -> bool:
     return False
 
 
+def _bps_matches(value: Decimal, decimals: int, allowed: list[Decimal]) -> bool:
+    """True if `value` bps matches `a * 100` or a difference `abs(a - b) * 100` in `allowed`."""
+    if matches(value / Decimal(100), decimals + 2, allowed):
+        return True
+    step = Decimal(1).scaleb(-decimals)
+    for i, a in enumerate(allowed):
+        for b in allowed[i + 1 :]:
+            diff_bps = abs(a - b) * Decimal(100)
+            if diff_bps.quantize(step) == value or abs(diff_bps - value) <= step / 2:
+                return True
+    return False
+
+
 def unsupported_figures(text: str, quotes: list[str]) -> list[str]:
     allowed = _values(quotes)
-    return [written for value, k, written in figures(text) if not matches(value, k, allowed)]
+    cleaned = MARKER.sub(" ", text)
+    out = []
+    for m in NUMBER.finditer(cleaned):
+        whole, frac = m.group(1), m.group(2)
+        try:
+            value = Decimal(whole.replace(",", "") + (f".{frac}" if frac else ""))
+        except InvalidOperation:
+            continue
+        after = cleaned[m.end() : m.end() + 16]
+        before = cleaned[max(0, m.start() - 12) : m.start()]
+        unit = FIGURE_AFTER.match(after)
+        if frac is None and not unit and "Rs" not in before and "₹" not in before:
+            if value <= 12 or 1990 <= value <= 2100:
+                continue
+            if value <= 31 and (
+                re.match(rf"\s*{MONTHS}", after, re.I) or re.search(rf"{MONTHS}\s*$", before, re.I)
+            ):
+                continue
+        if cleaned[max(0, m.start() - 1) : m.start()] == "-" and value <= 12:
+            continue
+        k = len(frac or "")
+        if matches(value, k, allowed):
+            continue
+        if BPS_AFTER.match(after) and _bps_matches(value, k, allowed):
+            continue
+        out.append(m.group(0))
+    return out
 
 
 def check_paragraph(

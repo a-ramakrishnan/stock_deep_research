@@ -351,6 +351,109 @@ def _date(d) -> str:
     return d.strftime("%d %b %Y") if d else "-"
 
 
+def _fmt_num(v) -> str:
+    if v is None or v == "":
+        return "-"
+    try:
+        d = Decimal(str(v))
+        if d == d.to_integral():
+            return f"{int(d):,}"
+        return f"{d:,.2f}".rstrip("0").rstrip(".")
+    except Exception:
+        return str(v)
+
+
+def section_tables(session: Session, run: Run) -> dict[str, str]:
+    """Deterministic Markdown tables built strictly from collected `shared` sources."""
+    sources = list(
+        session.scalars(
+            select(Source).where(
+                Source.run_id == run.id,
+                Source.dataset.in_(("results", "balance_sheets", "peers")),
+            )
+        )
+    )
+    out: dict[str, str] = {}
+
+    primary_results = sorted(
+        (
+            s.data
+            for s in sources
+            if s.dataset == "results"
+            and s.data
+            and s.data.get("primary")
+            and s.data.get("period_end")
+        ),
+        key=lambda d: str(d["period_end"]),
+        reverse=True,
+    )
+    quarters = [d for d in primary_results if int(d.get("months") or 0) == 3][:8]
+    years = [d for d in primary_results if int(d.get("months") or 0) == 12][:5]
+    fin_blocks: list[str] = []
+    for title, rows in (("Quarterly results", quarters), ("Annual results", years)):
+        if not rows:
+            continue
+        lines = [
+            f"### {title} *(from XBRL / shared results)*",
+            "",
+            "| Period | Basis | Revenue (Rs cr) | PBT (Rs cr) | PAT (Rs cr) | EPS (Rs) |",
+            "| --- | --- | ---: | ---: | ---: | ---: |",
+        ]
+        for r in rows:
+            lines.append(
+                f"| {r.get('period') or r.get('period_end')} | {r.get('basis', '-')} | "
+                f"{_fmt_num(r.get('revenue_cr'))} | {_fmt_num(r.get('pbt_cr'))} | "
+                f"{_fmt_num(r.get('pat_cr'))} | {_fmt_num(r.get('eps'))} |"
+            )
+        fin_blocks.append("\n".join(lines))
+    if fin_blocks:
+        out["financials"] = "\n\n".join(fin_blocks)
+
+    sheets = sorted(
+        (
+            s.data
+            for s in sources
+            if s.dataset == "balance_sheets" and s.data and s.data.get("period_end")
+        ),
+        key=lambda d: str(d["period_end"]),
+        reverse=True,
+    )[:4]
+    if sheets:
+        lines = [
+            "### Balance sheet & cash flow *(from shared balance sheets)*",
+            "",
+            "| Period End | Basis | Equity (Rs cr) | Borrowings (Rs cr) | Cash (Rs cr) | "
+            "CFO (Rs cr) | Capex (Rs cr) |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
+        ]
+        for r in sheets:
+            lines.append(
+                f"| {r.get('period_end')} | {r.get('basis', '-')} | "
+                f"{_fmt_num(r.get('equity_cr'))} | {_fmt_num(r.get('borrowings_cr'))} | "
+                f"{_fmt_num(r.get('cash_cr'))} | {_fmt_num(r.get('cfo_cr'))} | "
+                f"{_fmt_num(r.get('capex_cr'))} |"
+            )
+        out["balance"] = "\n".join(lines)
+
+    peers = [s.data for s in sources if s.dataset == "peers" and s.data]
+    if peers and (peers[0].get("rows") or []):
+        lines = [
+            "### Listed peers *(from shared data)*",
+            "",
+            "| Symbol | Company | Market Cap (Rs cr) | Latest Period | PAT (Rs cr) |",
+            "| --- | --- | ---: | --- | ---: |",
+        ]
+        for r in peers[0]["rows"]:
+            lines.append(
+                f"| {r.get('nse_symbol') or '-'} | {r.get('name') or r.get('isin')} | "
+                f"{_fmt_num(r.get('market_cap_cr'))} | {r.get('latest_period') or '-'} | "
+                f"{_fmt_num(r.get('latest_pat_cr'))} |"
+            )
+        out["industry"] = "\n".join(lines)
+
+    return out
+
+
 def render(
     run: Run,
     company_name: str,
@@ -361,6 +464,7 @@ def render(
     limits: list[str],
     dropped: list[str],
     review_notes: list[str],
+    tables: dict[str, str] | None = None,
 ) -> tuple[str, dict]:
     notes = Footnotes(facts)
     md = [
@@ -385,6 +489,8 @@ def render(
             sec = by_key.get(key)
             paras = [_para(p, notes) for p in sec.paragraphs] if sec else []
             md += ["\n\n".join(paras) if paras else "*Nothing verified to report.*"]
+            if tables and key in tables:
+                md += ["", tables[key]]
     md += ["", "## Coverage", "", "| Question | Status |", "| --- | --- |"]
     for q in facts.plan:
         state = facts.coverage.get(q.id, "open")
@@ -494,8 +600,18 @@ def write_report(
     version = (
         session.scalar(select(func.max(Report.version)).where(Report.isin == run.isin)) or 0
     ) + 1
+    tables = section_tables(session, run)
     markdown, sections = render(
-        run, company_name, version, draft, facts, result, limits, dropped, review_notes
+        run,
+        company_name,
+        version,
+        draft,
+        facts,
+        result,
+        limits,
+        dropped,
+        review_notes,
+        tables=tables,
     )
     report = Report(
         run_id=run.id,
