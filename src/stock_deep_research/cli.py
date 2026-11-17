@@ -313,3 +313,77 @@ def _print_findings(session, run_id: int) -> None:
         for qid, state in cover.items():
             typer.echo(f"  {state:<9}{qid}")
     typer.echo(f"\nRun {run.id}: {run.status}, ${run.cost_usd} of ${run.budget_usd}")
+
+
+@app.command("eval")
+def eval_cmd(
+    run_id: int | None = typer.Argument(None, help="A research run to score and audit."),
+    traps: bool = typer.Option(
+        False, "--traps", help="Run the 5-layer adversarial veracity traps."
+    ),
+) -> None:
+    """Evaluate a run's scorecard and 5-layer report veracity audit, or run the veracity traps."""
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session
+
+    from stock_deep_research import db
+    from stock_deep_research.eval import audit_report, run_traps, score_run
+    from stock_deep_research.models import Report
+
+    if traps or run_id is None:
+        results = run_traps()
+        for t in results:
+            mark = "PASS" if t.passed else "FAIL"
+            typer.echo(f"[{mark}] {t.layer:<30} {t.name}: {t.detail}")
+        if not all(t.passed for t in results):
+            raise typer.Exit(1)
+        if run_id is None:
+            return
+
+    with Session(db.engine()) as session:
+        try:
+            card = score_run(session, run_id)
+        except ValueError as exc:
+            typer.echo(str(exc))
+            raise typer.Exit(1) from None
+        typer.echo(
+            f"Run {card.run_id} ({card.symbol}): {card.status} · model {card.model} · "
+            f"${card.cost_usd} of ${card.budget_usd}"
+        )
+        typer.echo(
+            f"  mandatory coverage   {card.mandatory_answered}/{card.mandatory_total} "
+            f"({card.mandatory_coverage_pct:.0f}%)"
+        )
+        typer.echo(
+            f"  quote fidelity       {card.quotes_located}/{card.quotes_total} "
+            f"({card.quote_fidelity_pct:.0f}%)"
+        )
+        typer.echo(
+            f"  supported facts      {card.facts_supported}/{card.facts_total} "
+            f"(follow-up: {card.followup_questions} questions, "
+            f"{card.followup_sources_read} sources)"
+        )
+        rep = session.scalar(
+            select(Report)
+            .where(Report.run_id == run_id)
+            .order_by(Report.version.desc(), Report.id.desc())
+            .limit(1)
+        )
+        if rep is not None:
+            veracity = audit_report(session, rep)
+            typer.echo(
+                f"  report v{veracity.version} ({veracity.outcome}): "
+                f"{card.paragraphs_verified}/{card.paragraphs_total} paragraphs verified, "
+                f"{card.paragraphs_dropped} dropped"
+            )
+            typer.echo(
+                f"  figure precision     {veracity.figures_verified}/{veracity.figures_total} "
+                f"({veracity.figure_precision_pct:.0f}%: {veracity.figures_from_shared} shared, "
+                f"{veracity.figures_from_derived} derived, {veracity.figures_from_web} web)"
+            )
+            typer.echo(
+                f"  excerpt integrity    {veracity.excerpts_intact}/{veracity.excerpts_checked} "
+                f"({veracity.excerpt_integrity_pct:.0f}%)"
+            )
+            for w in veracity.warnings:
+                typer.echo(f"  warning: {w}")

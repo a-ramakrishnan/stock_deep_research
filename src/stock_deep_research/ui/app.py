@@ -360,6 +360,221 @@ def report_page() -> None:
         st.markdown(chosen.markdown.replace("$", "\\$"))
 
 
+def evaluation_page() -> None:
+    from stock_deep_research.eval import audit_report, run_traps, score_run
+    from stock_deep_research.models import Report
+    from stock_deep_research.report import OUTCOMES
+
+    st.title("Evaluation & Data Veracity")
+    st.caption(
+        "Agent evaluation scorecard (R4) and 5-layer veracity auditing: how every claim and "
+        "figure in a final report is traced back to its exact source passage and SHA-256 hash. "
+        + DISCLAIMER
+    )
+
+    with st.expander(
+        "How we verify veracity of data in the final report (5 layers)", expanded=False
+    ):
+        st.markdown(
+            "1. **Layer 1 · Cryptographic Source & Quote Offset (`excerpts.verify`):** Every "
+            "`Source` stores a `sha256` hash of its text when read. Every `Finding` must quote a "
+            "verbatim passage, and code locates its character index (`start_char`) in "
+            "`Source.text`. Facts whose quotes are not found are downgraded to `insufficient`.\n"
+            "2. **Layer 2 · Figure-to-Quote Decimal Matching (`review.unsupported_figures`):** "
+            "Every number in a report paragraph is parsed and matched against the numbers inside "
+            "the verbatim quotes of the findings cited by *that* paragraph (allowing standard "
+            "rounding).\n"
+            "3. **Layer 3 · Deterministic Math Provenance (`derived.py`):** Growth rates, "
+            "margins, trailing EPS, P/E, net debt, D/E, FCF and cash conversion are computed in "
+            "Python `Decimal` from primary XBRL records (`derived:<SYMBOL>:figures`), never by "
+            "model arithmetic.\n"
+            "4. **Layer 4 · Basis, Period & Freshness Consistency (`eval.audit_report`):** "
+            "Flags paragraphs citing non-primary `standalone` figures without stating "
+            "`'standalone'`, checks whether `financials` cites the newest primary quarter, and "
+            "blocks future dates outside `catalysts`.\n"
+            "5. **Layer 5 · Omission, Contradiction & Gap Honesty (`eval.score_run`):** "
+            "Flags collected `red_flags` sources or `conflicting` findings omitted from the "
+            "report, and verifies that unanswered questions appear as explicit `*Not found:*` gaps."
+        )
+        traps = run_traps()
+        st.dataframe(
+            [
+                {
+                    "Trap": t.name,
+                    "Verification Layer": t.layer,
+                    "Status": "Caught" if t.passed else "MISSED",
+                    "Detail": t.detail,
+                }
+                for t in traps
+            ],
+            hide_index=True,
+            width="stretch",
+        )
+
+    with Session(db.engine()) as session:
+        runs = session.scalars(
+            select(Run).where(Run.plan.has_key("questions")).order_by(Run.id.desc()).limit(50)
+        ).all()
+        if not runs:
+            st.info("No research runs yet. Run `sdr research LT` to evaluate a report.")
+            return
+
+        cards = [score_run(session, r.id) for r in runs]
+        with st.expander("All research runs benchmark", expanded=False):
+            st.dataframe(
+                [
+                    {
+                        "Run": c.run_id,
+                        "Symbol": c.symbol,
+                        "Status": c.status,
+                        "Outcome": OUTCOMES.get(c.report_outcome, c.report_outcome or "-"),
+                        "Coverage": (
+                            f"{c.mandatory_answered}/{c.mandatory_total} "
+                            f"({c.mandatory_coverage_pct:.0f}%)"
+                        ),
+                        "Quote Fidelity": (
+                            f"{c.quotes_located}/{c.quotes_total} ({c.quote_fidelity_pct:.0f}%)"
+                        ),
+                        "Figure Precision": (
+                            f"{c.figures_verified}/{c.figures_total} "
+                            f"({c.figure_precision_pct:.0f}%)"
+                        ),
+                        "Dropped Paras": c.paragraphs_dropped,
+                        "Warnings": len(c.veracity_warnings),
+                        "Cost ($)": float(c.cost_usd),
+                        "Time (s)": c.wall_seconds,
+                    }
+                    for c in cards
+                ],
+                hide_index=True,
+                width="stretch",
+            )
+
+        ids = [r.id for r in runs]
+        run_id = st.selectbox(
+            "Inspect run & report veracity",
+            ids,
+            format_func=lambda i: next(
+                f"Run {r.id} · {r.symbol or r.isin} · {r.requested_at:%d %b %Y %H:%M} · "
+                f"{r.status} · ${r.cost_usd}"
+                for r in runs
+                if r.id == i
+            ),
+        )
+        card = next(c for c in cards if c.run_id == run_id)
+
+        cols = st.columns(5)
+        cols[0].metric(
+            "Mandatory coverage",
+            f"{card.mandatory_answered}/{card.mandatory_total}",
+            f"{card.mandatory_coverage_pct:.0f}%",
+        )
+        cols[1].metric(
+            "Quote fidelity",
+            f"{card.quotes_located}/{card.quotes_total}",
+            f"{card.quote_fidelity_pct:.0f}% located",
+        )
+        cols[2].metric(
+            "Figure precision",
+            f"{card.figures_verified}/{card.figures_total}",
+            f"{card.figure_precision_pct:.0f}% traced",
+        )
+        cols[3].metric(
+            "Paragraphs verified",
+            f"{card.paragraphs_verified}/{card.paragraphs_total}",
+            f"{card.paragraphs_dropped} dropped",
+        )
+        cols[4].metric(
+            "Run cost",
+            f"${card.cost_usd:.2f}",
+            f"${card.cost_per_supported_fact}/fact" if card.cost_per_supported_fact else None,
+        )
+
+        if card.stage_costs:
+            fu_note = (
+                f" · Follow-ups: {card.followup_questions} "
+                f"({card.followup_sources_read} sources read)"
+                if card.followup_questions
+                else ""
+            )
+            st.caption(
+                "Stage spend: "
+                + " · ".join(f"**{k}** \\${v:.4f}" for k, v in card.stage_costs.items())
+                + fu_note
+            )
+
+        rep = session.scalar(
+            select(Report)
+            .where(Report.run_id == run_id)
+            .order_by(Report.version.desc(), Report.id.desc())
+            .limit(1)
+        )
+        if rep is None:
+            st.info("No report has been written for this run yet.")
+            return
+
+        veracity = audit_report(session, rep)
+        outcome_label = OUTCOMES.get(veracity.outcome, veracity.outcome)
+        st.subheader(f"Report v{veracity.version} Veracity Audit ({outcome_label})")
+        vcols = st.columns(4)
+        vcols[0].metric(
+            "Excerpt hash & offset check",
+            f"{veracity.excerpts_intact}/{veracity.excerpts_checked}",
+        )
+        vcols[1].metric("Figures from shared records", veracity.figures_from_shared)
+        vcols[2].metric("Figures from derived.py math", veracity.figures_from_derived)
+        vcols[3].metric("Figures from web pages", veracity.figures_from_web)
+
+        if veracity.warnings:
+            for w in veracity.warnings:
+                st.warning(f"Veracity warning: {w}")
+        else:
+            st.success(
+                "All 5 veracity layers passed with zero basis, freshness or omission warnings."
+            )
+
+        fig_rows = [
+            {
+                "Paragraph": p.where,
+                "Figure Written": ft.written,
+                "Matched Value": str(ft.matched_value) if ft.matched_value is not None else "-",
+                "Status": "Verified" if ft.verified else "UNSUPPORTED",
+                "Finding": f"F{ft.finding_id}" if ft.finding_id else "-",
+                "Source": f"S{ft.source_id}" if ft.source_id else "-",
+                "Dataset": ft.dataset or "-",
+                "Source Ref": ft.source_ref or "-",
+                "Verbatim Quote": ft.quote or "-",
+            }
+            for p in veracity.paragraphs
+            for ft in p.figures
+        ]
+        st.markdown("#### Figure-by-Figure Lineage (Every Number in the Final Report)")
+        if fig_rows:
+            st.dataframe(fig_rows, hide_index=True, width="stretch")
+        else:
+            st.caption("No figures in this report.")
+
+        st.markdown("#### Paragraph-by-Paragraph Claim Audit")
+        st.dataframe(
+            [
+                {
+                    "Address": p.where,
+                    "Section": p.section,
+                    "Kind": p.kind,
+                    "Status": "Verified" if p.verified else "Issues found",
+                    "Findings": ", ".join(f"F{i}" for i in p.finding_ids) or "-",
+                    "Sources": ", ".join(f"S{i}" for i in p.source_ids) or "-",
+                    "Figures": len(p.figures),
+                    "Issues": "; ".join(p.issues) if p.issues else "None",
+                    "Text": p.text,
+                }
+                for p in veracity.paragraphs
+            ],
+            hide_index=True,
+            width="stretch",
+        )
+
+
 def main() -> None:
     st.set_page_config(page_title="Deep research", page_icon=":material/travel_explore:")
     page = st.navigation(
@@ -368,6 +583,7 @@ def main() -> None:
             st.Page(report_page, title="Report", icon=":material/article:"),
             st.Page(findings_page, title="Findings", icon=":material/checklist:"),
             st.Page(evidence_page, title="Evidence", icon=":material/fact_check:"),
+            st.Page(evaluation_page, title="Evaluation & Veracity", icon=":material/verified:"),
         ]
     )
     page.run()
