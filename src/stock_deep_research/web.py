@@ -1,49 +1,43 @@
-"""The open web, through Claude's web search and web fetch tools, kept as sources.
+"""The open web, through Gemini's Google Search grounding and direct HTTP/PDF fetching.
 
-`ask_web` puts one question to the model with both tools, for what the shared data can't
-answer (industry, competitors, regulation, management backgrounds). Every page it fetches is
-kept as a `Source` with its URL, title, retrieval time, content hash and text; every search
-result it saw but didn't fetch is kept as `listed` (no text, so it can't be cited); a page that
-couldn't be fetched is kept as `blocked` or `failed`, a recorded gap. The model's answer is a
-lead for the research loop (R2), not evidence: only the pages are.
+`ask_web` puts one question to Gemini with Google Search grounding, keeps every grounded search
+result as a `listed` source, and fetches the top URLs (HTML or PDF) via `httpx` + `pypdf` into
+full-text `ok` `Source` records (or `blocked` / `failed` / `unreadable` when inaccessible). The
+model's answer is a lead for the research loop (R2), not evidence: only the fetched pages are.
 """
 
-import base64
-import binascii
+import html
 import io
+import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 
-import anthropic
+import httpx
+from google import genai
+from google.genai import types
 from pypdf import PdfReader
 
-from stock_deep_research import costs
+from stock_deep_research import costs, gemini
 from stock_deep_research.evidence import Evidence
 from stock_deep_research.models import Source
 
 MAX_SEARCHES = 5
 MAX_FETCHES = 6
-PAGE_TOKENS = 30_000  # cap on one fetched page, to bound a call's cost
-CONTINUATIONS = 3  # a long server-side tool turn may pause; resume it at most this often
+MAX_PAGE_CHARS = 120_000
+FETCH_TIMEOUT = 15.0
+BLOCKED_CODES = {401, 403, 429, 451}
 
-TOOLS = [
-    {"type": "web_search_20260209", "name": "web_search", "max_uses": MAX_SEARCHES},
-    {
-        "type": "web_fetch_20260209",
-        "name": "web_fetch",
-        "max_uses": MAX_FETCHES,
-        "max_content_tokens": PAGE_TOKENS,
-    },
-]
-BLOCKED = {"url_not_allowed", "url_not_accessible", "too_many_requests"}
+_SCRIPT_STYLE = re.compile(r"<(script|style|noscript)[^>]*>.*?</\1>", re.I | re.S)
+_TITLE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
+_TAG = re.compile(r"<[^>]+>")
+_SPACE = re.compile(r"[ \t]+")
+_NEWLINES = re.compile(r"\n{3,}")
 
 SYSTEM = """You research an Indian listed company for an evidence-first report.
-Answer the question from pages you fetch: search, then fetch the pages that answer it (the \
-company's own site and filings, regulators, reputable news and industry bodies first). Prefer \
-recent pages; say when a page is old. Quote the passages you rely on exactly as they appear. If \
-the pages don't answer the question, say so: never fill a gap with what seems plausible. \
-No buy, sell or hold opinions."""
+Use Google Search to find authoritative pages (the company's own site and filings, regulators,
+credit rating agencies, industry bodies and reputable financial news). Prefer recent pages and
+state dates clearly. Never fill a gap with what seems plausible. No buy, sell or hold opinions."""
 
 
 @dataclass
@@ -56,140 +50,186 @@ class WebAnswer:
     stop_reason: str | None = None
 
 
-def _when(stamp: str | None) -> datetime | None:
-    if not stamp:
+def _extract_pdf_bytes(raw: bytes | None) -> str | None:
+    """Extract plain text from raw PDF bytes; None if empty or invalid."""
+    if not raw:
         return None
     try:
-        return datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-
-
-def _extract_pdf_text(b64_data: str | None) -> str | None:
-    """Extract plain text from base64-encoded PDF bytes; None if empty or invalid."""
-    if not b64_data:
-        return None
-    try:
-        raw = base64.b64decode(b64_data, validate=False)
         reader = PdfReader(io.BytesIO(raw))
         pages = [page.extract_text() or "" for page in reader.pages]
         text = "\n\n".join(p.strip() for p in pages if p.strip()).strip()
-        return text or None
-    except (binascii.Error, Exception):
+        return text[:MAX_PAGE_CHARS] or None
+    except Exception:
         return None
 
 
-def harvest(evidence: Evidence, content: list) -> list[Source]:
-    """Keep every search result and fetched page in a response's content as sources."""
-    asked: dict[str, dict] = {}  # server tool call id -> its input (the URL fetched)
+def _extract_html_text(raw_html: str) -> tuple[str | None, str]:
+    """Return `(title, clean_text)` from an HTML document."""
+    m = _TITLE.search(raw_html)
+    title = html.unescape(_TAG.sub("", m.group(1))).strip() if m else None
+    cleaned = _SCRIPT_STYLE.sub(" ", raw_html)
+    cleaned = re.sub(r"</(?:p|div|li|tr|h[1-6]|br|section|article)>", "\n", cleaned, flags=re.I)
+    cleaned = html.unescape(_TAG.sub(" ", cleaned))
+    lines = [_SPACE.sub(" ", line).strip() for line in cleaned.splitlines()]
+    text = _NEWLINES.sub("\n\n", "\n".join(line for line in lines if line)).strip()
+    return title or None, text[:MAX_PAGE_CHARS]
+
+
+def harvest_grounding(evidence: Evidence, response) -> list[Source]:
+    """Keep every URL returned by Gemini Google Search grounding as a `listed` source."""
     kept: list[Source] = []
-    for block in content:
-        kind = getattr(block, "type", None)
-        if kind == "server_tool_use":
-            asked[block.id] = dict(block.input or {})
-        elif kind == "web_search_tool_result":
-            query = asked.get(block.tool_use_id, {}).get("query")
-            if not isinstance(block.content, list):  # an error object, not results
+    candidates = getattr(response, "candidates", None) or []
+    for cand in candidates:
+        gm = getattr(cand, "grounding_metadata", None)
+        if not gm:
+            continue
+        queries = list(getattr(gm, "web_search_queries", None) or [])
+        query_str = "; ".join(str(q) for q in queries) if queries else None
+        for chunk in getattr(gm, "grounding_chunks", None) or []:
+            web_chunk = getattr(chunk, "web", None)
+            if not web_chunk:
                 continue
-            for r in block.content:
-                kept.append(
-                    evidence.keep(
-                        kind="web",
-                        dataset="web",
-                        ref=r.url,
-                        title=r.title,
-                        status="listed",
-                        data={"page_age": r.page_age, "query": query},
-                    )
-                )
-        elif kind == "web_fetch_tool_result":
-            result = block.content
-            url = getattr(result, "url", None) or asked.get(block.tool_use_id, {}).get("url")
+            url = getattr(web_chunk, "uri", None)
             if not url:
                 continue
-            if getattr(result, "type", None) == "web_fetch_result":
-                doc = result.content
-                src_type = getattr(doc.source, "type", None)
-                media_type = getattr(doc.source, "media_type", None)
-                body = None
-                if src_type == "text":
-                    body = doc.source.data
-                elif src_type == "base64" and media_type == "application/pdf":
-                    body = _extract_pdf_text(getattr(doc.source, "data", None))
-                kept.append(
-                    evidence.keep(
-                        kind="web",
-                        dataset="web",
-                        ref=url,
-                        title=doc.title,
-                        body=body,
-                        status="ok" if body else "unreadable",
-                        retrieved_at=_when(result.retrieved_at),
-                        data={"media_type": media_type},
-                    )
+            title = getattr(web_chunk, "title", None)
+            kept.append(
+                evidence.keep(
+                    kind="web",
+                    dataset="web",
+                    ref=url,
+                    title=title,
+                    status="listed",
+                    data={"query": query_str} if query_str else None,
                 )
-            else:
-                code = getattr(result, "error_code", "unknown")
-                kept.append(
-                    evidence.keep(
-                        kind="web",
-                        dataset="web",
-                        ref=url,
-                        status="blocked" if code in BLOCKED else "failed",
-                        data={"error": code},
-                    )
-                )
+            )
     return kept
+
+
+def fetch_url(
+    evidence: Evidence,
+    url: str,
+    *,
+    http: httpx.Client | None = None,
+) -> Source:
+    """Fetch `url` (HTML, plain text or PDF) and keep it as a `Source`."""
+    now = datetime.now(UTC)
+    headers = {"User-Agent": "stock-deep-research/0.1 (+https://github.com/a-ramakrishnan)"}
+    try:
+        if http is not None:
+            resp = http.get(url, headers=headers, follow_redirects=True, timeout=FETCH_TIMEOUT)
+        else:
+            with httpx.Client(follow_redirects=True, timeout=FETCH_TIMEOUT) as client:
+                resp = client.get(url, headers=headers)
+    except httpx.HTTPError as exc:
+        return evidence.keep(
+            kind="web",
+            dataset="web",
+            ref=url,
+            status="failed",
+            retrieved_at=now,
+            data={"error": type(exc).__name__},
+        )
+
+    final_url = str(getattr(resp, "url", url) or url)
+    status_code = getattr(resp, "status_code", 200)
+    if status_code in BLOCKED_CODES:
+        return evidence.keep(
+            kind="web",
+            dataset="web",
+            ref=url,
+            status="blocked",
+            retrieved_at=now,
+            data={"status_code": status_code, "final_url": final_url},
+        )
+    if status_code >= 400:
+        return evidence.keep(
+            kind="web",
+            dataset="web",
+            ref=url,
+            status="failed",
+            retrieved_at=now,
+            data={"status_code": status_code, "final_url": final_url},
+        )
+
+    content_type = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+    is_pdf = content_type == "application/pdf" or final_url.lower().endswith(".pdf")
+    if is_pdf:
+        body = _extract_pdf_bytes(resp.content)
+        return evidence.keep(
+            kind="web",
+            dataset="web",
+            ref=url,
+            body=body,
+            status="ok" if body else "unreadable",
+            retrieved_at=now,
+            data={"media_type": content_type or "application/pdf", "final_url": final_url},
+        )
+
+    raw_text = resp.text or ""
+    if "html" in content_type or "<html" in raw_text[:500].lower():
+        title, body = _extract_html_text(raw_text)
+    else:
+        title, body = None, raw_text.strip()[:MAX_PAGE_CHARS]
+
+    return evidence.keep(
+        kind="web",
+        dataset="web",
+        ref=url,
+        title=title,
+        body=body or None,
+        status="ok" if body else "unreadable",
+        retrieved_at=now,
+        data={"media_type": content_type or "text/plain", "final_url": final_url},
+    )
 
 
 def ask_web(
     evidence: Evidence,
     question: str,
-    client: anthropic.Anthropic | None = None,
+    client: genai.Client | None = None,
     model: str | None = None,
+    *,
+    http: httpx.Client | None = None,
+    max_fetches: int = MAX_FETCHES,
 ) -> WebAnswer:
-    """Put `question` about the run's company to the web; keep what was read."""
+    """Put `question` about the run's company to Google Search via Gemini and fetch top pages."""
     from stock_deep_research.config import get_settings
 
     settings = get_settings()
     model = model or settings.research_model
-    client = client or anthropic.Anthropic(api_key=settings.anthropic_api_key or None)
+    client = client or gemini.make_client()
     c = evidence.company
-    messages: list[dict] = [
-        {
-            "role": "user",
-            "content": f"Company: {c.name} (NSE: {c.nse_symbol or '-'}, ISIN {c.isin}, "
-            f"industry: {c.industry or 'unknown'}).\n\nQuestion: {question}",
-        }
-    ]
-    found = WebAnswer(answer="")
-    texts: list[str] = []
-    for _ in range(CONTINUATIONS + 1):
-        response = client.beta.messages.create(
-            model=model,
-            max_tokens=16_000,
-            system=SYSTEM,
-            tools=TOOLS,
-            messages=messages,
-            output_config={"effort": "medium"},
-            betas=["server-side-fallback-2026-07-01"],
-            fallbacks="default",
-        )
-        found.cost_usd += costs.cost(model, response.usage)
-        server = getattr(response.usage, "server_tool_use", None)
-        if server:
-            found.searches += server.web_search_requests or 0
-            found.fetches += server.web_fetch_requests or 0
-        found.sources += harvest(evidence, response.content)
-        texts += [b.text for b in response.content if getattr(b, "type", None) == "text"]
-        found.stop_reason = response.stop_reason
-        if response.stop_reason != "pause_turn":
-            break
-        messages.append({"role": "assistant", "content": response.content})
-    found.sources = list({s.id: s for s in found.sources}.values())
-    found.answer = "\n".join(t for t in texts if t).strip()
-    if found.stop_reason == "refusal":
-        found.answer = "(declined)"
+    prompt = (
+        f"Company: {c.name} (NSE: {c.nse_symbol or '-'}, ISIN {c.isin}, "
+        f"industry: {c.industry or 'unknown'}).\n\nQuestion: {question}"
+    )
+    response = client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM,
+            max_output_tokens=8_000,
+            tools=[types.Tool(google_search=types.GoogleSearch())],
+        ),
+    )
+    cost = costs.response_cost(model, response)
+    searches = costs.search_count(response)
+    listed = harvest_grounding(evidence, response)
+
+    fetched: list[Source] = []
+    for s in listed[:max_fetches]:
+        fetched.append(fetch_url(evidence, s.ref, http=http))
+
+    all_sources = list({s.id: s for s in [*listed, *fetched]}.values())
+    found = WebAnswer(
+        answer=(getattr(response, "text", None) or "").strip(),
+        sources=all_sources,
+        cost_usd=cost,
+        searches=searches,
+        fetches=len(fetched),
+        stop_reason=gemini.finish_reason(response),
+    )
     evidence.run.tool_calls = (evidence.run.tool_calls or 0) + found.searches + found.fetches
     pages = sum(1 for s in found.sources if s.retrieval_status == "ok")
     evidence.event(

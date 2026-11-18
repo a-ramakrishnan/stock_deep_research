@@ -40,7 +40,7 @@ def health() -> None:
     except Exception as exc:  # report and carry on: this is a health check
         ok = False
         typer.echo(f"own database  FAILED: {type(exc).__name__}; run `sdr db init`")
-    key = "set" if get_settings().anthropic_api_key else "not set (reports can't be written)"
+    key = "set" if get_settings().gemini_api_key else "not set (reports can't be written)"
     typer.echo(f"API key       {key}")
     if not ok:
         raise typer.Exit(1)
@@ -95,8 +95,8 @@ def evidence(
     if found is None:
         typer.echo(f"No single company matches '{query}'.")
         raise typer.Exit(1)
-    if web and not settings.anthropic_api_key:
-        typer.echo("--web needs ANTHROPIC_API_KEY in .env.")
+    if web and not settings.gemini_api_key:
+        typer.echo("--web needs GEMINI_API_KEY in .env.")
         raise typer.Exit(1)
     with Session(db.engine()) as session:
         run = new_run(
@@ -193,8 +193,8 @@ def research(
     from stock_deep_research.research import research as run_research
 
     settings = get_settings()
-    if not settings.anthropic_api_key:
-        typer.echo("Research needs ANTHROPIC_API_KEY in .env.")
+    if not settings.gemini_api_key:
+        typer.echo("Research needs GEMINI_API_KEY in .env.")
         raise typer.Exit(1)
     shared_eng = db.shared_engine()
     version = shared.check_contract(shared_eng)
@@ -236,8 +236,8 @@ def report_cmd(run_id: int) -> None:
     from stock_deep_research import db, shared
     from stock_deep_research.models import Run
 
-    if not get_settings().anthropic_api_key:
-        typer.echo("Writing a report needs ANTHROPIC_API_KEY in .env.")
+    if not get_settings().gemini_api_key:
+        typer.echo("Writing a report needs GEMINI_API_KEY in .env.")
         raise typer.Exit(1)
     with Session(db.engine()) as session:
         run = session.get(Run, run_id)

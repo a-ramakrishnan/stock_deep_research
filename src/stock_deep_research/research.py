@@ -17,18 +17,18 @@
 What the run did is in its decision record (`run_events`), not the model's reasoning.
 """
 
-import json
 from collections.abc import Callable
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Literal
 
-import anthropic
+from google import genai
+from google.genai import types
 from pydantic import BaseModel
 from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session
 
-from stock_deep_research import costs, excerpts, tools, web
+from stock_deep_research import costs, excerpts, gemini, tools
 from stock_deep_research.budget import Budget, BudgetStop
 from stock_deep_research.derived import derive
 from stock_deep_research.evidence import Evidence, new_run
@@ -40,7 +40,7 @@ RESEARCH_SHARE = Decimal("0.7")
 ASSESS_TOKENS = 16_000  # thinking and the findings
 SOURCE_CHARS = 5_000  # of one source in an assessment's context
 DOCUMENT_CHARS = 24_000  # of a filing, article or web page
-SECTION_CHARS = 140_000  # of all sources in one assessment (about 40k tokens)
+SECTION_CHARS = 400_000  # of all sources in one assessment (~100k tokens for Gemini)
 MAX_FOLLOW_UPS = 6
 GATHER_TURNS = 8
 GATHER_TOKENS = 8_000
@@ -166,7 +166,7 @@ def _company(c: Company) -> str:
 
 def assess(
     evidence: Evidence,
-    client: anthropic.Anthropic,
+    client: genai.Client,
     model: str,
     budget: Budget,
     section: Section,
@@ -181,20 +181,18 @@ def assess(
         f"Section: {section.title}\n\nQuestions:\n{_questions(questions)}\n\nSources:\n\n{body}"
     )
     budget.reserve(model, len(ASSESS_SYSTEM) + len(prompt), ASSESS_TOKENS)
-    response = client.messages.parse(
+    parsed, cost, stop_reason = gemini.parse_structured(
+        client,
         model=model,
-        max_tokens=ASSESS_TOKENS,
         system=ASSESS_SYSTEM,
-        messages=[{"role": "user", "content": prompt}],
-        output_format=Assessment,
-        output_config={"effort": "medium"},
+        prompt=prompt,
+        schema=Assessment,
+        max_tokens=ASSESS_TOKENS,
     )
-    cost = costs.response_cost(model, response)
-    parsed = response.parsed_output if response.stop_reason != "refusal" else None
     if parsed is None:
         evidence.event(
             "assess",
-            f"{section.title}: no assessment ({response.stop_reason}) over {len(shown)} sources",
+            f"{section.title}: no assessment ({stop_reason}) over {len(shown)} sources",
             cost,
         )
         return [], []
@@ -247,13 +245,13 @@ def _period(v: str) -> date | None:
         return None
 
 
-def _tool_input_chars(messages: list) -> int:
-    return len(json.dumps(messages, default=lambda o: repr(o)))
+def _tool_input_chars(contents: list) -> int:
+    return sum(len(str(c)) for c in contents)
 
 
 def gather(
     evidence: Evidence,
-    client: anthropic.Anthropic,
+    client: genai.Client,
     model: str,
     budget: Budget,
     question: Question,
@@ -261,17 +259,11 @@ def gather(
 ) -> list[Source]:
     """One tool-using pass at an open question. Returns the readable sources it read."""
     start = evidence.mark()
-    web_tools = [
-        {**web.TOOLS[0], "max_uses": GATHER_SEARCHES},
-        {**web.TOOLS[1], "max_uses": GATHER_FETCHES},
-    ]
-    messages: list[dict] = [
-        {
-            "role": "user",
-            "content": f"Company: {_company(evidence.company)}\n\nQuestion: {question.text}\n"
-            + (f"What is missing so far: {missing}\n" if missing else ""),
-        }
-    ]
+    user_text = f"Company: {_company(evidence.company)}\n\nQuestion: {question.text}\n" + (
+        f"What is missing so far: {missing}\n" if missing else ""
+    )
+    contents: list = [types.Content(role="user", parts=[types.Part.from_text(text=user_text)])]
+    tool_cfg = [types.Tool(function_declarations=tools.DECLARATIONS)]
     searches = fetches = turns = 0
     cost = Decimal(0)
     try:
@@ -279,46 +271,48 @@ def gather(
             turns += 1
             budget.reserve(
                 model,
-                len(GATHER_SYSTEM) + _tool_input_chars(messages),
+                len(GATHER_SYSTEM) + _tool_input_chars(contents),
                 GATHER_TOKENS,
                 searches=GATHER_SEARCHES,
             )
-            response = client.beta.messages.create(
+            response = client.models.generate_content(
                 model=model,
-                max_tokens=GATHER_TOKENS,
-                system=GATHER_SYSTEM,
-                tools=[*tools.TOOLS, *web_tools],
-                messages=messages,
-                cache_control={"type": "ephemeral"},
-                output_config={"effort": "medium"},
-                betas=["server-side-fallback-2026-07-01"],
-                fallbacks="default",
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=GATHER_SYSTEM,
+                    max_output_tokens=GATHER_TOKENS,
+                    tools=tool_cfg,
+                ),
             )
             step = costs.response_cost(model, response)
             cost += step
             evidence.run.cost_usd = Decimal(evidence.run.cost_usd or 0) + step
-            server = getattr(response.usage, "server_tool_use", None)
-            if server:
-                searches += server.web_search_requests or 0
-                fetches += server.web_fetch_requests or 0
-            web.harvest(evidence, response.content)
-            messages.append({"role": "assistant", "content": response.content})
-            if response.stop_reason == "tool_use":
-                results = [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": b.id,
-                        "content": tools.handle(evidence, b.name, dict(b.input or {})),
-                    }
-                    for b in response.content
-                    if getattr(b, "type", None) == "tool_use"
-                ]
-                evidence.run.tool_calls = (evidence.run.tool_calls or 0) + len(results)
-                messages.append({"role": "user", "content": results})
-                continue
-            if response.stop_reason == "pause_turn":
-                continue
-            break
+
+            candidates = getattr(response, "candidates", None) or []
+            if candidates and getattr(candidates[0], "content", None):
+                contents.append(candidates[0].content)
+
+            calls = getattr(response, "function_calls", None) or []
+            if not calls:
+                break
+
+            response_parts = []
+            for call in calls:
+                name = call.name
+                args = dict(call.args or {})
+                if name == "web_search" and searches >= GATHER_SEARCHES:
+                    answer, ds, df = "Search limit reached for this question.", 0, 0
+                elif name == "web_fetch" and fetches >= GATHER_FETCHES:
+                    answer, ds, df = "Fetch limit reached for this question.", 0, 0
+                else:
+                    answer, ds, df = tools.handle(evidence, name, args, client=client, model=model)
+                searches += ds
+                fetches += df
+                response_parts.append(
+                    types.Part.from_function_response(name=name, response={"result": answer})
+                )
+            evidence.run.tool_calls = (evidence.run.tool_calls or 0) + len(calls)
+            contents.append(types.Content(role="user", parts=response_parts))
     finally:
         # the cost so far was added to the run step by step; record the step once
         evidence.run.cost_usd = Decimal(evidence.run.cost_usd or 0) - cost
@@ -356,7 +350,7 @@ def research(
     *,
     request: str = "report",
     questions: list[str] | None = None,
-    client: anthropic.Anthropic | None = None,
+    client: genai.Client | None = None,
     model: str | None = None,
     budget_usd: float | None = None,
     contract_version: str | None = None,
@@ -369,7 +363,7 @@ def research(
     settings = get_settings()
     model = model or settings.research_model
     budget_usd = budget_usd if budget_usd is not None else settings.report_budget_usd
-    client = client or anthropic.Anthropic(api_key=settings.anthropic_api_key or None)
+    client = client or gemini.make_client()
     today = today or date.today()
 
     run = new_run(session, company, request, model, budget_usd, contract_version)

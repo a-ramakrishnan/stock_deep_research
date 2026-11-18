@@ -232,8 +232,8 @@ def findings_page() -> None:
             )
             go = st.form_submit_button("Research", type="primary")
         if go and query.strip():
-            if not settings.anthropic_api_key:
-                st.error("Research needs ANTHROPIC_API_KEY in .env.")
+            if not settings.gemini_api_key:
+                st.error("Research needs GEMINI_API_KEY in .env.")
             else:
                 made = _run_research(query, [q for q in extra.splitlines() if q.strip()], version)
                 if made:
@@ -270,7 +270,7 @@ def findings_page() -> None:
         cols[3].metric(f"Cost (budget ${run.budget_usd:.2f})", f"${run.cost_usd:.2f}")
         if run.error:
             st.error(run.error)
-        if run.status in ("succeeded", "partial") and settings.anthropic_api_key:
+        if run.status in ("succeeded", "partial") and settings.gemini_api_key:
             if st.button("Write a new version of the report from these findings"):
                 from stock_deep_research.report import OUTCOMES, write_report
 

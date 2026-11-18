@@ -14,8 +14,8 @@ class Settings(BaseSettings):
     )
     # This project's own database: reports, findings, sources.
     database_url: str = "postgresql+psycopg://sna:sna@localhost:5433/deep_research"
-    anthropic_api_key: str = ""
-    research_model: str = "claude-sonnet-5-5"
+    gemini_api_key: str = ""
+    research_model: str = "gemini-2.5-pro"
     report_budget_usd: float = 5.0
 
 

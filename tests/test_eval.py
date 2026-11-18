@@ -15,29 +15,33 @@ from stock_deep_research.models import Finding
 from stock_deep_research.plan import Question, to_json
 
 TODAY = date(2026, 11, 5)
-SONNET = "claude-sonnet-5-5"
+GEMINI = "gemini-2.5-pro"
 
 
 class ScriptWriter:
     def __init__(self, draft):
         self.draft = draft
-        self.messages = NS(parse=self.parse)
+        self.models = NS(generate_content=self.generate_content)
 
-    def parse(self, **kw):
+    def generate_content(self, **kw):
         usage = NS(
-            input_tokens=10_000,
-            output_tokens=2_000,
-            cache_creation_input_tokens=0,
-            cache_read_input_tokens=0,
-            server_tool_use=None,
+            prompt_token_count=10_000,
+            candidates_token_count=2_000,
+            cached_content_token_count=0,
+            thoughts_token_count=0,
         )
-        if kw["output_format"] is report.Draft:
-            return NS(parsed_output=self.draft, stop_reason="end_turn", usage=usage, model=SONNET)
+        if kw["config"].response_schema is report.Draft:
+            return NS(
+                parsed=self.draft,
+                candidates=[NS(finish_reason="STOP")],
+                usage_metadata=usage,
+                model_version=GEMINI,
+            )
         return NS(
-            parsed_output=report.ReviewOut(issues=[]),
-            stop_reason="end_turn",
-            usage=usage,
-            model=SONNET,
+            parsed=report.ReviewOut(issues=[]),
+            candidates=[NS(finish_reason="STOP")],
+            usage_metadata=usage,
+            model_version=GEMINI,
         )
 
 
@@ -71,7 +75,7 @@ def test_score_run_and_veracity_lineage(research_url, shared_url, monkeypatch):
     shared_eng = create_engine(shared_url)
     company = shared.find_company(shared_eng, "LT")
     with Session(create_engine(research_url)) as session:
-        run = new_run(session, company, "eval test", SONNET, 5.0, "1.0")
+        run = new_run(session, company, "eval test", GEMINI, 5.0, "1.0")
         ev = Evidence(session, run, shared_eng, company)
         ev.collect()
         figures_src = derive(ev)
@@ -174,7 +178,7 @@ def test_score_run_and_veracity_lineage(research_url, shared_url, monkeypatch):
             ],
         )
         made = report.write_report(
-            session, run, company.name, client=ScriptWriter(d), model=SONNET, today=TODAY
+            session, run, company.name, client=ScriptWriter(d), model=GEMINI, today=TODAY
         )
         veracity = eval_mod.audit_report(session, made, today=TODAY)
         assert veracity.warnings == []
@@ -204,7 +208,7 @@ def test_veracity_flags_standalone_stale_quarter_and_omitted_red_flags(research_
     shared_eng = create_engine(shared_url)
     company = shared.find_company(shared_eng, "LT")
     with Session(create_engine(research_url)) as session:
-        run = new_run(session, company, "warnings test", SONNET, 5.0, "1.0")
+        run = new_run(session, company, "warnings test", GEMINI, 5.0, "1.0")
         ev = Evidence(session, run, shared_eng, company)
         ev.collect()
         q1 = ev.get("shared.results:LT:2026-06-30:3m:consolidated")
@@ -279,7 +283,7 @@ def test_veracity_flags_standalone_stale_quarter_and_omitted_red_flags(research_
             ],
         )
         made = report.write_report(
-            session, run, company.name, client=ScriptWriter(d), model=SONNET, today=TODAY
+            session, run, company.name, client=ScriptWriter(d), model=GEMINI, today=TODAY
         )
         veracity = eval_mod.audit_report(session, made, today=TODAY)
         joined = "\n".join(veracity.warnings)
