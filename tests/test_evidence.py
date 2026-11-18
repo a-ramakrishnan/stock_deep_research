@@ -16,7 +16,7 @@ def ev(research_url, shared_url):
     shared_eng = create_engine(shared_url)
     company = shared.find_company(shared_eng, "LT")
     with Session(create_engine(research_url)) as session:
-        run = new_run(session, company, "test", "claude-sonnet-5-5", 5.0, "1.0")
+        run = new_run(session, company, "test", "gemini-2.5-pro", 5.0, "1.0")
         yield Evidence(session, run, shared_eng, company)
         session.rollback()
 
@@ -75,142 +75,136 @@ def test_excerpts_are_located_or_marked_missing(ev):
 
 @pytest.mark.db
 def test_research_tools(ev):
-    answer = tools.handle(ev, "shared_data", {"dataset": "orders"})
+    answer, _, _ = tools.handle(ev, "shared_data", {"dataset": "orders"})
     assert answer.startswith("[S") and "Saudi Aramco" in answer and "ref: shared.orders:1" in answer
-    assert "No such" in tools.handle(ev, "read_document", {"document_id": 999})
-    hits = tools.handle(ev, "search_documents", {"query": "middle east"})
+    assert "No such" in tools.handle(ev, "read_document", {"document_id": 999})[0]
+    hits, _, _ = tools.handle(ev, "search_documents", {"query": "middle east"})
     assert '"document_id": 11' in hits and "Order inflow" in hits
-    assert "Unknown dataset" in tools.handle(ev, "shared_data", {"dataset": "nope"})
+    assert "Unknown dataset" in tools.handle(ev, "shared_data", {"dataset": "nope"})[0]
     names = [t["name"] for t in tools.TOOLS]
-    assert names == ["shared_data", "search_documents", "read_document"]
-    assert set(tools.TOOLS[0]["input_schema"]["properties"]["dataset"]["enum"]) == set(DATASETS)
+    assert names == ["shared_data", "search_documents", "read_document", "web_search", "web_fetch"]
+    assert set(tools.TOOLS[0]["parameters"]["properties"]["dataset"]["enum"]) == set(DATASETS)
 
 
-def _response(content, stop="end_turn", searches=1, fetches=2):
+def _gemini_web_response(text, chunks, queries=("L&T peers",), inp=10_000, out=1_000):
     usage = NS(
-        input_tokens=10_000,
-        output_tokens=1_000,
-        cache_creation_input_tokens=0,
-        cache_read_input_tokens=0,
-        server_tool_use=NS(web_search_requests=searches, web_fetch_requests=fetches),
+        prompt_token_count=inp,
+        candidates_token_count=out,
+        cached_content_token_count=0,
+        thoughts_token_count=0,
     )
-    return NS(content=content, stop_reason=stop, usage=usage)
-
-
-def _page(url, body, media="text/plain"):
-    kind = "text" if media == "text/plain" else "base64"
+    gm = NS(
+        web_search_queries=list(queries),
+        grounding_chunks=[NS(web=NS(uri=u, title=t)) for u, t in chunks],
+    )
     return NS(
-        type="web_fetch_result",
-        url=url,
-        retrieved_at="2026-11-05T10:00:00Z",
-        content=NS(title=f"Page {url}", source=NS(type=kind, data=body, media_type=media)),
+        text=text,
+        candidates=[NS(finish_reason="STOP", grounding_metadata=gm)],
+        usage_metadata=usage,
+        model_version="gemini-2.5-pro",
     )
 
 
-class FakeClient:
+class FakeGeminiWebClient:
     def __init__(self, responses):
         self.responses = list(responses)
         self.calls = []
-        self.beta = NS(messages=NS(create=self.create))
+        self.models = NS(generate_content=self.generate_content)
 
-    def create(self, **kwargs):
+    def generate_content(self, **kwargs):
         self.calls.append(kwargs)
         return self.responses.pop(0)
 
 
+class FakeHttp:
+    def __init__(self, pages):
+        self.pages = pages
+
+    def get(self, url, **kwargs):
+        return self.pages[url]
+
+
 @pytest.mark.db
 def test_web_pages_are_kept_as_sources(ev):
-    first = _response(
-        [
-            NS(type="server_tool_use", id="s1", name="web_search", input={"query": "L&T peers"}),
-            NS(
-                type="web_search_tool_result",
-                tool_use_id="s1",
-                content=[
-                    NS(url="https://a.example/x", title="A", page_age="2 days ago"),
-                    NS(url="https://b.example/y", title="B", page_age=None),
-                    NS(url="https://c.example/z", title="C", page_age=None),
-                ],
-            ),
-            NS(
-                type="server_tool_use",
-                id="f1",
-                name="web_fetch",
-                input={"url": "https://a.example/x"},
-            ),
-            NS(
-                type="web_fetch_tool_result",
-                tool_use_id="f1",
-                content=_page("https://a.example/x", "L&T leads EPC."),
-            ),
+    resp = _gemini_web_response(
+        "L&T leads Indian EPC.",
+        chunks=[
+            ("https://a.example/x", "A"),
+            ("https://b.example/y", "B"),
+            ("https://c.example/z", "C"),
+            ("https://d.example/r.pdf", "D"),
         ],
-        stop="pause_turn",
     )
-    second = _response(
-        [
-            NS(
-                type="server_tool_use",
-                id="f2",
-                name="web_fetch",
-                input={"url": "https://b.example/y"},
+    http = FakeHttp(
+        {
+            "https://a.example/x": NS(
+                url="https://a.example/x",
+                status_code=200,
+                headers={"content-type": "text/plain"},
+                text="L&T leads EPC.",
+                content=b"L&T leads EPC.",
             ),
-            NS(
-                type="web_fetch_tool_result",
-                tool_use_id="f2",
-                content=NS(type="web_fetch_tool_result_error", error_code="url_not_accessible"),
+            "https://b.example/y": NS(
+                url="https://b.example/y",
+                status_code=403,
+                headers={"content-type": "text/html"},
+                text="",
+                content=b"",
             ),
-            NS(
-                type="server_tool_use",
-                id="f3",
-                name="web_fetch",
-                input={"url": "https://d.example/r.pdf"},
+            "https://d.example/r.pdf": NS(
+                url="https://d.example/r.pdf",
+                status_code=200,
+                headers={"content-type": "application/pdf"},
+                text="",
+                content=b"not-a-valid-pdf",
             ),
-            NS(
-                type="web_fetch_tool_result",
-                tool_use_id="f3",
-                content=_page("https://d.example/r.pdf", "JVBER", "application/pdf"),
-            ),
-            NS(type="text", text="L&T leads Indian EPC."),
-        ],
-        searches=0,
-        fetches=2,
+        }
     )
-    client = FakeClient([first, second])
-    answer = web.ask_web(ev, "Who are L&T's competitors?", client=client, model="claude-sonnet-5-5")
+    client = FakeGeminiWebClient([resp])
+    answer = web.ask_web(
+        ev,
+        "Who are L&T's competitors?",
+        client=client,
+        model="gemini-2.5-pro",
+        http=http,
+        max_fetches=2,  # fetch a and b; leave c and d as listed
+    )
 
-    assert answer.answer == "L&T leads Indian EPC." and answer.stop_reason == "end_turn"
-    assert len(client.calls) == 2  # resumed after pause_turn
-    assert client.calls[1]["messages"][-1]["role"] == "assistant"
-    assert client.calls[0]["tools"][0]["type"] == "web_search_20260209"
+    assert answer.answer == "L&T leads Indian EPC." and answer.stop_reason == "stop"
+    assert len(client.calls) == 1
     status = {s.ref: s.retrieval_status for s in answer.sources}
     assert status == {
         "https://a.example/x": "ok",
         "https://b.example/y": "blocked",
         "https://c.example/z": "listed",
-        "https://d.example/r.pdf": "unreadable",
+        "https://d.example/r.pdf": "listed",
     }
+    pdf_src = web.fetch_url(ev, "https://d.example/r.pdf", http=http)
+    assert pdf_src.retrieval_status == "unreadable" and pdf_src.text is None
     page = ev.get("https://a.example/x")
     assert page.text == "L&T leads EPC." and page.kind == "web" and page.content_hash
-    assert page.retrieved_at.year == 2026 and page.data["media_type"] == "text/plain"
-    assert ev.get("https://d.example/r.pdf").text is None
-    # cost: two responses of 10k in / 1k out at Sonnet prices, plus one search
-    assert answer.cost_usd == Decimal("0.0700")
-    assert ev.run.cost_usd == Decimal("0.0700") and ev.run.tool_calls == 5
+    assert page.data["media_type"] == "text/plain"
+    # cost: 10k in ($0.0125) + 1k out ($0.01) + 1 Google Search ($0.035) = $0.0575
+    assert answer.cost_usd == Decimal("0.0575")
+    assert ev.run.cost_usd == Decimal("0.0575") and ev.run.tool_calls == 3
     event = ev.session.scalar(select(RunEvent).where(RunEvent.run_id == ev.run.id))
-    assert "1 searches, 4 fetches, 1 pages kept" in event.message
+    assert "1 searches, 2 fetches, 1 pages kept" in event.message
 
 
 def test_costs():
-    usage = NS(input_tokens=1_000_000, output_tokens=0, server_tool_use=None)
-    assert costs.cost("claude-sonnet-5-5", usage) == Decimal("2.0000")
+    usage = NS(
+        prompt_token_count=1_000_000,
+        candidates_token_count=0,
+        cached_content_token_count=0,
+        thoughts_token_count=0,
+    )
+    assert costs.cost("gemini-2.5-pro", usage) == Decimal("1.2500")
     with pytest.raises(ValueError):
         costs.cost("unknown-model", usage)
 
 
 def test_extract_pdf_text_handles_invalid_and_valid_pdfs():
-    import base64
-
-    assert web._extract_pdf_text("JVBER") is None  # invalid/truncated PDF
+    assert web._extract_pdf_bytes(b"JVBER") is None  # invalid/truncated PDF
     # Minimal valid 1-page PDF with "L&T Order" text stream
     pdf = (
         b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
@@ -223,7 +217,7 @@ def test_extract_pdf_text_handles_invalid_and_valid_pdfs():
         b"0000000111 00000 n \n0000000237 00000 n \n0000000305 00000 n \n"
         b"trailer<</Size 6/Root 1 0 R>>\nstartxref\n398\n%%EOF"
     )
-    extracted = web._extract_pdf_text(base64.b64encode(pdf).decode())
+    extracted = web._extract_pdf_bytes(pdf)
     assert extracted is not None and "L&T Order" in extracted
 
 

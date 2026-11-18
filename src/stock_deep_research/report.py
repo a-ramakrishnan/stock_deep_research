@@ -22,12 +22,12 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Literal
 
-import anthropic
+from google import genai
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from stock_deep_research import costs
+from stock_deep_research import gemini
 from stock_deep_research.budget import Budget, BudgetStop
 from stock_deep_research.models import Excerpt, Finding, Report, Run, RunEvent, Source
 from stock_deep_research.plan import SECTION, Question, from_json
@@ -199,7 +199,7 @@ def _company_line(run: Run) -> str:
 
 
 def write(
-    client: anthropic.Anthropic,
+    client: genai.Client,
     model: str,
     budget: Budget,
     facts: Facts,
@@ -220,21 +220,18 @@ def write(
             + "\n- ".join(problems or [])
         )
     budget.reserve(model, len(WRITE_SYSTEM) + len(prompt), WRITE_TOKENS)
-    response = client.messages.parse(
+    return gemini.parse_structured(
+        client,
         model=model,
-        max_tokens=WRITE_TOKENS,
         system=WRITE_SYSTEM,
-        messages=[{"role": "user", "content": prompt}],
-        output_format=Draft,
-        output_config={"effort": "medium"},
+        prompt=prompt,
+        schema=Draft,
+        max_tokens=WRITE_TOKENS,
     )
-    cost = costs.response_cost(model, response)
-    draft = response.parsed_output if response.stop_reason != "refusal" else None
-    return draft, cost, response.stop_reason or ""
 
 
 def model_review(
-    client: anthropic.Anthropic, model: str, budget: Budget, facts: Facts, draft: Draft
+    client: genai.Client, model: str, budget: Budget, facts: Facts, draft: Draft
 ) -> tuple[list[ReviewIssue], Decimal]:
     blocks = []
     for where, _, para in addresses(draft):
@@ -249,16 +246,14 @@ def model_review(
         + "\n\n".join(blocks)
     )
     budget.reserve(model, len(REVIEW_SYSTEM) + len(prompt), REVIEW_TOKENS)
-    response = client.messages.parse(
+    out, cost, _ = gemini.parse_structured(
+        client,
         model=model,
-        max_tokens=REVIEW_TOKENS,
         system=REVIEW_SYSTEM,
-        messages=[{"role": "user", "content": prompt}],
-        output_format=ReviewOut,
-        output_config={"effort": "medium"},
+        prompt=prompt,
+        schema=ReviewOut,
+        max_tokens=REVIEW_TOKENS,
     )
-    cost = costs.response_cost(model, response)
-    out = response.parsed_output if response.stop_reason != "refusal" else None
     return (out.issues if out else []), cost
 
 
@@ -540,17 +535,14 @@ def write_report(
     run: Run,
     company_name: str,
     *,
-    client: anthropic.Anthropic | None = None,
+    client: genai.Client | None = None,
     model: str | None = None,
     today: date | None = None,
     progress: Callable[[str], None] = lambda _: None,
 ) -> Report:
     """Write, review and publish a report from a finished research run."""
-    from stock_deep_research.config import get_settings
-
-    settings = get_settings()
     model = model or run.model
-    client = client or anthropic.Anthropic(api_key=settings.anthropic_api_key or None)
+    client = client or gemini.make_client()
     today = today or date.today()
     budget = Budget(run, Decimal(run.budget_usd))
     facts = load(session, run)

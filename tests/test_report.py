@@ -16,7 +16,7 @@ from stock_deep_research.plan import Question, to_json
 from stock_deep_research.review import Cited, check_paragraph, figures, unsupported_figures
 
 TODAY = date(2026, 11, 5)
-SONNET = "claude-sonnet-5-5"
+GEMINI = "gemini-2.5-pro"
 
 
 # ------------------------------------------------------------------ the checks
@@ -90,7 +90,7 @@ def run_with_findings(research_url, shared_url):
     shared_eng = create_engine(shared_url)
     company = shared.find_company(shared_eng, "LT")
     with Session(create_engine(research_url)) as session:
-        run = new_run(session, company, "report test", SONNET, 5.0, "1.0")
+        run = new_run(session, company, "report test", GEMINI, 5.0, "1.0")
         ev = Evidence(session, run, shared_eng, company)
         ev.collect()
         figures_src = derive(ev)
@@ -213,31 +213,31 @@ class Writer:
         self.drafts = list(drafts)
         self.reviews = list(reviews)
         self.prompts = []
-        self.messages = NS(parse=self.parse)
+        self.models = NS(generate_content=self.generate_content)
 
-    def parse(self, **kw):
-        self.prompts.append(kw["messages"][0]["content"])
+    def generate_content(self, **kw):
+        self.prompts.append(kw["contents"])
         usage = NS(
-            input_tokens=20_000,
-            output_tokens=4_000,
-            cache_creation_input_tokens=0,
-            cache_read_input_tokens=0,
-            server_tool_use=None,
+            prompt_token_count=20_000,
+            candidates_token_count=4_000,
+            cached_content_token_count=0,
+            thoughts_token_count=0,
         )
-        if kw["output_format"] is report.Draft:
+        schema = kw["config"].response_schema
+        if schema is report.Draft:
             out = self.drafts.pop(0)
             return NS(
-                parsed_output=out,
-                stop_reason="refusal" if out is None else "end_turn",
-                usage=usage,
-                model=SONNET,
+                parsed=out,
+                candidates=[NS(finish_reason="SAFETY" if out is None else "STOP")],
+                usage_metadata=usage,
+                model_version=GEMINI,
             )
         issues = self.reviews.pop(0) if self.reviews else []
         return NS(
-            parsed_output=report.ReviewOut(issues=issues),
-            stop_reason="end_turn",
-            usage=usage,
-            model=SONNET,
+            parsed=report.ReviewOut(issues=issues),
+            candidates=[NS(finish_reason="STOP")],
+            usage_metadata=usage,
+            model_version=GEMINI,
         )
 
 
@@ -247,7 +247,7 @@ def test_a_clean_draft_is_validated(run_with_findings):
     before = run.cost_usd
     writer = Writer([draft(ids)])
     made = report.write_report(
-        session, run, "Larsen & Toubro Limited", client=writer, model=SONNET, today=TODAY
+        session, run, "Larsen & Toubro Limited", client=writer, model=GEMINI, today=TODAY
     )
     assert made.outcome == "validated"
     assert len(writer.prompts) == 2  # written once, reviewed once, nothing to repair
@@ -284,7 +284,7 @@ def test_problems_are_repaired_once_and_what_still_fails_is_dropped(run_with_fin
     repaired = draft(ids, extra_valuation=[advice])  # fixes the figure, keeps the advice
     review = [report.ReviewIssue(where="industry.2", problem="overstated", blocking=True)]
     writer = Writer([first, repaired], [review])
-    made = report.write_report(session, run, "L&T", client=writer, model=SONNET, today=TODAY)
+    made = report.write_report(session, run, "L&T", client=writer, model=GEMINI, today=TODAY)
 
     assert len(writer.prompts) == 3
     repair = writer.prompts[2]
@@ -309,13 +309,13 @@ def test_problems_are_repaired_once_and_what_still_fails_is_dropped(run_with_fin
 def test_no_draft_is_a_rejected_report_that_still_shows_coverage(run_with_findings):
     session, run, _ = run_with_findings
     made = report.write_report(
-        session, run, "L&T", client=Writer([None]), model=SONNET, today=TODAY
+        session, run, "L&T", client=Writer([None]), model=GEMINI, today=TODAY
     )
     assert made.outcome == "rejected"
     assert "**Rejected**" in made.markdown and "## Coverage" in made.markdown
     assert "no draft could be written" in made.markdown
     again = report.write_report(
-        session, run, "L&T", client=Writer([None]), model=SONNET, today=TODAY
+        session, run, "L&T", client=Writer([None]), model=GEMINI, today=TODAY
     )
     assert again.version == made.version + 1 and report.latest(session, run.isin).id == again.id
 
@@ -325,7 +325,7 @@ def test_budget_left_for_writing_is_respected(run_with_findings):
     session, run, ids = run_with_findings
     run.cost_usd = Decimal("4.90")  # research spent nearly all of it
     made = report.write_report(
-        session, run, "L&T", client=Writer([draft(ids)]), model=SONNET, today=TODAY
+        session, run, "L&T", client=Writer([draft(ids)]), model=GEMINI, today=TODAY
     )
     assert made.outcome == "rejected" and run.cost_usd == Decimal("4.90")
     assert "Budget reached" in made.markdown
@@ -337,7 +337,7 @@ def test_export_command(run_with_findings, research_url, shared_url, monkeypatch
     from stock_deep_research.config import get_settings
 
     session, run, ids = run_with_findings
-    report.write_report(session, run, "L&T", client=Writer([draft(ids)]), model=SONNET, today=TODAY)
+    report.write_report(session, run, "L&T", client=Writer([draft(ids)]), model=GEMINI, today=TODAY)
     monkeypatch.setenv("DATABASE_URL", research_url)
     monkeypatch.setenv("SHARED_DATABASE_URL", shared_url)
     get_settings.cache_clear()

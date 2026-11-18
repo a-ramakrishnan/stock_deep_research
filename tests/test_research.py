@@ -15,7 +15,7 @@ from stock_deep_research.models import Excerpt, Finding, RunEvent, Source
 from stock_deep_research.plan import QUESTIONS, SECTIONS, make_plan
 
 TODAY = date(2026, 11, 5)
-SONNET = "claude-sonnet-5-5"
+GEMINI = "gemini-2.5-pro"
 
 
 @pytest.fixture
@@ -27,13 +27,12 @@ def setup(research_url, shared_url):
         session.rollback()
 
 
-def usage(inp=20_000, out=2_000, searches=0, fetches=0):
+def usage(inp=20_000, out=2_000):
     return NS(
-        input_tokens=inp,
-        output_tokens=out,
-        cache_creation_input_tokens=0,
-        cache_read_input_tokens=0,
-        server_tool_use=NS(web_search_requests=searches, web_fetch_requests=fetches),
+        prompt_token_count=inp,
+        candidates_token_count=out,
+        cached_content_token_count=0,
+        thoughts_token_count=0,
     )
 
 
@@ -42,17 +41,41 @@ def source_id(prompt: str, title: str) -> int:
 
 
 class FakeClient:
-    """Answers assessments by section, and plays one follow-up: a shared_data call, then a
-    web search and fetch."""
+    """Answers structured assessments by section, and plays one follow-up: a shared_data call,
+    then a web_search + web_fetch."""
 
     def __init__(self):
         self.parsed = []
         self.created = []
-        self.messages = NS(parse=self.parse)
-        self.beta = NS(messages=NS(create=self.create))
+        self.models = NS(generate_content=self.generate_content)
 
-    def parse(self, **kw):
-        prompt = kw["messages"][0]["content"]
+    def generate_content(self, **kw):
+        cfg = kw["config"]
+        if getattr(cfg, "response_schema", None) is research.Assessment:
+            return self._assess(kw["contents"])
+        if getattr(cfg, "tools", None) and any(
+            getattr(t, "google_search", None) is not None for t in cfg.tools
+        ):
+            # web_search tool call inside gather
+            return NS(
+                text="L&T is the largest EPC company.",
+                candidates=[
+                    NS(
+                        finish_reason="STOP",
+                        grounding_metadata=NS(
+                            web_search_queries=["EPC"],
+                            grounding_chunks=[
+                                NS(web=NS(uri="https://web.example/epc2", title="EPC league table"))
+                            ],
+                        ),
+                    )
+                ],
+                usage_metadata=usage(2_000, 200),
+                model_version=GEMINI,
+            )
+        return self._gather_turn(kw)
+
+    def _assess(self, prompt: str):
         self.parsed.append(prompt)
         section = re.search(r"Section: (.+)", prompt).group(1)
         A, F, C, G = (
@@ -117,59 +140,38 @@ class FakeClient:
                 ),
                 G(question="industry.market", missing="demand drivers", look="none", query=""),
             ]
-        return NS(parsed_output=out, stop_reason="end_turn", usage=usage(), model=SONNET)
-
-    def create(self, **kw):
-        self.created.append(kw)
-        turn = len(self.created)
-        if turn % 2 == 1:  # read the collected orders first
-            return NS(
-                content=[
-                    NS(
-                        type="tool_use",
-                        id=f"t{turn}",
-                        name="shared_data",
-                        input={"dataset": "orders"},
-                    ),
-                ],
-                stop_reason="tool_use",
-                usage=usage(5_000, 500),
-                model=SONNET,
-            )
-        url = f"https://web.example/epc{turn}"
         return NS(
-            content=[
-                NS(
-                    type="server_tool_use", id=f"s{turn}", name="web_search", input={"query": "EPC"}
-                ),
-                NS(
-                    type="web_search_tool_result",
-                    tool_use_id=f"s{turn}",
-                    content=[NS(url=url, title="EPC league table", page_age=None)],
-                ),
-                NS(type="server_tool_use", id=f"f{turn}", name="web_fetch", input={"url": url}),
-                NS(
-                    type="web_fetch_tool_result",
-                    tool_use_id=f"f{turn}",
-                    content=NS(
-                        type="web_fetch_result",
-                        url=url,
-                        retrieved_at="2026-11-05T10:00:00Z",
-                        content=NS(
-                            title="EPC league table",
-                            source=NS(
-                                type="text",
-                                media_type="text/plain",
-                                data="By order book, L&T is the largest EPC company.",
-                            ),
-                        ),
-                    ),
-                ),
-                NS(type="text", text="Found a league table."),
-            ],
-            stop_reason="end_turn",
-            usage=usage(8_000, 800, searches=1, fetches=1),
-            model=SONNET,
+            parsed=out,
+            candidates=[NS(finish_reason="STOP")],
+            usage_metadata=usage(),
+            model_version=GEMINI,
+        )
+
+    def _gather_turn(self, kw):
+        self.created.append(kw)
+        n = len(kw["contents"])
+        if n == 1:
+            return NS(
+                function_calls=[NS(name="shared_data", args={"dataset": "orders"})],
+                candidates=[NS(finish_reason="STOP", content=NS(role="model", parts=[]))],
+                usage_metadata=usage(5_000, 500),
+                model_version=GEMINI,
+            )
+        if n == 3:
+            return NS(
+                function_calls=[
+                    NS(name="web_search", args={"query": "EPC"}),
+                    NS(name="web_fetch", args={"url": "https://web.example/epc2"}),
+                ],
+                candidates=[NS(finish_reason="STOP", content=NS(role="model", parts=[]))],
+                usage_metadata=usage(8_000, 800),
+                model_version=GEMINI,
+            )
+        return NS(
+            function_calls=[],
+            candidates=[NS(finish_reason="STOP", content=NS(role="model", parts=[]))],
+            usage_metadata=usage(4_000, 400),
+            model_version=GEMINI,
         )
 
 
@@ -183,17 +185,17 @@ def test_plan_covers_every_section():
 def test_budget_reserves_the_worst_case():
     run = NS(cost_usd=Decimal("3.40"))
     b = budget_mod.Budget(run, Decimal("3.50"))
-    # 30,000 characters ~ 10,000 tokens ($0.02) + 8,000 output tokens ($0.08) = $0.10
-    assert b.worst_case(SONNET, 30_000, 8_000) == Decimal("0.1")
-    b.reserve(SONNET, 30_000, 8_000)
+    # 30,000 characters ~ 10,000 tokens ($0.0125) + 8,000 output tokens ($0.08) = $0.0925
+    assert b.worst_case(GEMINI, 30_000, 8_000) == Decimal("0.0925")
+    b.reserve(GEMINI, 30_000, 8_000)
     with pytest.raises(budget_mod.BudgetStop):
-        b.reserve(SONNET, 30_000, 8_000, searches=1)
+        b.reserve(GEMINI, 30_000, 8_000, searches=1)
 
 
 @pytest.mark.db
 def test_derived_figures(setup):
     session, shared_eng, company = setup
-    run = new_run(session, company, "test", SONNET, 5.0, "1.0")
+    run = new_run(session, company, "test", GEMINI, 5.0, "1.0")
     ev = Evidence(session, run, shared_eng, company)
     figures = derive(ev)
     text = figures.text
@@ -250,16 +252,30 @@ def test_is_financial_sector_detection():
 
 
 @pytest.mark.db
-def test_research_run(setup):
+def test_research_run(setup, monkeypatch):
+    from stock_deep_research import web
+
     session, shared_eng, company = setup
     client = FakeClient()
+    monkeypatch.setattr(
+        web,
+        "fetch_url",
+        lambda ev, url, **kw: ev.keep(
+            kind="web",
+            dataset="web",
+            ref=url,
+            title="EPC league table",
+            body="By order book, L&T is the largest EPC company.",
+            status="ok",
+        ),
+    )
     steps = []
     run = research.research(
         session,
         shared_eng,
         company,
         client=client,
-        model=SONNET,
+        model=GEMINI,
         budget_usd=5.0,
         contract_version="1.0",
         today=TODAY,
@@ -295,11 +311,10 @@ def test_research_run(setup):
     ]
     assert events[0].startswith("16 questions (15 mandatory); research may spend $3.50 of $5.00")
     assert any(m.startswith("industry.market: skipped") for m in events)
-    assert any(m.startswith("industry.position: 2 turns, 1 searches, 1 fetches") for m in events)
+    assert any(m.startswith("industry.position: 3 turns, 1 searches, 1 fetches") for m in events)
     assert events[-1].startswith("succeeded:")
-    tool_results = client.created[1]["messages"][2]["content"][0]
-    assert tool_results["type"] == "tool_result" and "Saudi Aramco" in tool_results["content"]
-    assert client.created[0]["tools"][-1]["max_uses"] == research.GATHER_FETCHES
+    tool_resp = client.created[1]["contents"][2].parts[0].function_response.response
+    assert "Saudi Aramco" in tool_resp["result"]
 
     # costs: every call's actual cost is on the run, and the decision record adds up to it
     assert run.cost_usd == sum(
@@ -317,7 +332,7 @@ def test_research_stops_at_the_budget(setup):
         shared_eng,
         company,
         client=client,
-        model=SONNET,
+        model=GEMINI,
         budget_usd=0.6,
         contract_version="1.0",
         today=TODAY,

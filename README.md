@@ -34,7 +34,7 @@ You need stock_news_analyzer running (its database up to date: `make start` ther
 ```
 git clone https://github.com/a-ramakrishnan/stock_deep_research.git
 cd stock_deep_research
-cp .env.example .env        # add your Anthropic API key
+cp .env.example .env        # add your Gemini API key
 uv sync
 uv run sdr db init          # creates the deep_research database and its tables
 uv run sdr health           # both databases and the key
