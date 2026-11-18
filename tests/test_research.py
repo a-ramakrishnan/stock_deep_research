@@ -149,15 +149,15 @@ class FakeClient:
 
     def _gather_turn(self, kw):
         self.created.append(kw)
-        turn = len(self.created)
-        if turn == 1:
+        n = len(kw["contents"])
+        if n == 1:
             return NS(
                 function_calls=[NS(name="shared_data", args={"dataset": "orders"})],
                 candidates=[NS(finish_reason="STOP", content=NS(role="model", parts=[]))],
                 usage_metadata=usage(5_000, 500),
                 model_version=GEMINI,
             )
-        if turn == 2:
+        if n == 3:
             return NS(
                 function_calls=[
                     NS(name="web_search", args={"query": "EPC"}),

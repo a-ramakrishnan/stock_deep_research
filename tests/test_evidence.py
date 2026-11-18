@@ -75,12 +75,12 @@ def test_excerpts_are_located_or_marked_missing(ev):
 
 @pytest.mark.db
 def test_research_tools(ev):
-    answer = tools.handle(ev, "shared_data", {"dataset": "orders"})
+    answer, _, _ = tools.handle(ev, "shared_data", {"dataset": "orders"})
     assert answer.startswith("[S") and "Saudi Aramco" in answer and "ref: shared.orders:1" in answer
-    assert "No such" in tools.handle(ev, "read_document", {"document_id": 999})
-    hits = tools.handle(ev, "search_documents", {"query": "middle east"})
+    assert "No such" in tools.handle(ev, "read_document", {"document_id": 999})[0]
+    hits, _, _ = tools.handle(ev, "search_documents", {"query": "middle east"})
     assert '"document_id": 11' in hits and "Order inflow" in hits
-    assert "Unknown dataset" in tools.handle(ev, "shared_data", {"dataset": "nope"})
+    assert "Unknown dataset" in tools.handle(ev, "shared_data", {"dataset": "nope"})[0]
     names = [t["name"] for t in tools.TOOLS]
     assert names == ["shared_data", "search_documents", "read_document", "web_search", "web_fetch"]
     assert set(tools.TOOLS[0]["parameters"]["properties"]["dataset"]["enum"]) == set(DATASETS)
@@ -186,9 +186,9 @@ def test_web_pages_are_kept_as_sources(ev):
     assert page.data["media_type"] == "text/plain"
     # cost: 10k in ($0.0125) + 1k out ($0.01) + 1 Google Search ($0.035) = $0.0575
     assert answer.cost_usd == Decimal("0.0575")
-    assert ev.run.cost_usd == Decimal("0.0575") and ev.run.tool_calls == 4
+    assert ev.run.cost_usd == Decimal("0.0575") and ev.run.tool_calls == 3
     event = ev.session.scalar(select(RunEvent).where(RunEvent.run_id == ev.run.id))
-    assert "1 searches, 3 fetches, 1 pages kept" in event.message
+    assert "1 searches, 2 fetches, 1 pages kept" in event.message
 
 
 def test_costs():
