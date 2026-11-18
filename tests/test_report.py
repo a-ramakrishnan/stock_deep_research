@@ -39,6 +39,24 @@ def test_figures_must_be_in_the_cited_passages_allowing_for_rounding():
     assert unsupported_figures("Revenue was Rs 67,080 crore [F1]", quotes) == ["67,080"]
     assert unsupported_figures("up 10% [F1]", quotes) == []
     assert unsupported_figures("up 9.9% [F1]", quotes) == ["9.9"]
+    # Basis points from margin/rate deltas
+    margin_quotes = ["Q2 FY27 PAT margin 5.85%", "Q2 FY26 PAT margin 5.57%"]
+    assert unsupported_figures("PAT margin expanded 28 bps YoY [F1].", margin_quotes) == []
+    assert unsupported_figures("PAT margin expanded 150 bps YoY [F1].", margin_quotes) == ["150"]
+
+
+def test_ellipsis_multi_span_quote_location():
+    body = (
+        "Revenue from operations for Q2 FY27 was Rs 67,079 crore. "
+        "Order inflow was strong in Middle East."
+    )
+    pos = excerpts.locate(
+        body, "Revenue from operations ... Order inflow was strong in Middle East."
+    )
+    assert pos == 0
+    # Short spans (< 12 chars) or out-of-order spans must fail
+    assert excerpts.locate(body, "Revenue ... Order inflow") is None
+    assert excerpts.locate(body, "Order inflow was strong ... Revenue from operations") is None
 
 
 def test_check_paragraph():
